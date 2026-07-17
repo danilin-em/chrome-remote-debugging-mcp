@@ -1,0 +1,30 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write        # OIDC token for Trusted Publishing — no API token needed
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Check artifacts
+        run: uv run --with twine twine check dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # no `password:` — OIDC Trusted Publishing handles auth
