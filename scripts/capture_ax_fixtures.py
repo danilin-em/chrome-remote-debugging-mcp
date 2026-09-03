@@ -88,7 +88,8 @@ async def main() -> None:
         frames = await capture(args.cdp_url, ws_url, url, wait)
         if name == "probe":
             # Kept raw and uncompressed: small, and the only fixture that still
-            # carries name.sources, which test_strip_sources needs.
+            # carries name.sources, which test_raw_probe_still_carries_name_sources
+            # needs.
             (FIXTURES / "probe_raw.json").write_text(
                 json.dumps(frames, ensure_ascii=False), encoding="utf-8"
             )
