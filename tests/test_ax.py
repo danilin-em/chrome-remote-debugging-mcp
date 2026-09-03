@@ -84,3 +84,61 @@ def test_unnamed_backend_ids_skips_ignored_named_and_url_bearing():
          "backendDOMNodeId": 16},
     ]
     assert ax.unnamed_backend_ids(nodes) == [16]
+
+
+def test_format_interactive_uses_the_accessible_name():
+    node = {"role": {"value": "button"}, "name": {"value": "Отправить"}}
+    assert ax.format_interactive(node, 12, {}) == 'button#12 "Отправить"'
+
+
+def test_format_interactive_falls_back_to_url_then_attributes_then_marker():
+    with_url = {"role": {"value": "link"}, "name": {"value": ""},
+                "properties": [{"name": "url", "value": {"value": "https://x/v?id=1"}}]}
+    assert ax.format_interactive(with_url, 3, {}) == "link#3 -> https://x/v?id=1"
+
+    with_attr = {"role": {"value": "textbox"}, "name": {"value": ""},
+                 "backendDOMNodeId": 40}
+    assert ax.format_interactive(with_attr, 4, {40: {"name": "q"}}) == 'textbox#4 "q"'
+
+    nothing = {"role": {"value": "button"}, "name": {"value": ""},
+               "backendDOMNodeId": 41}
+    assert ax.format_interactive(nothing, 5, {41: {}}) == "button#5 [unnamed]"
+    assert ax.format_interactive(nothing, 5, {}) == "button#5 [unnamed]"
+
+
+def test_format_interactive_prefers_attributes_in_declared_order():
+    node = {"role": {"value": "textbox"}, "name": {"value": ""},
+            "backendDOMNodeId": 7}
+    attrs = {7: {"id": "search-box", "placeholder": "Найти", "name": "q"}}
+    assert ax.format_interactive(node, 1, attrs) == 'textbox#1 "Найти"'
+
+
+def test_format_interactive_appends_value_and_flags():
+    node = {
+        "role": {"value": "textbox"}, "name": {"value": "Поиск"},
+        "value": {"value": "котики"},
+        "properties": [
+            {"name": "required", "value": {"value": True}},
+            {"name": "readonly", "value": {"value": "false"}},
+            {"name": "focusable", "value": {"value": True}},
+        ],
+    }
+    assert ax.format_interactive(node, 7, {}) == 'textbox#7 "Поиск" = "котики" [required]'
+
+
+def test_format_interactive_omits_empty_value_and_absent_flags():
+    node = {"role": {"value": "textbox"}, "name": {"value": "Поиск"},
+            "value": {"value": ""}}
+    assert ax.format_interactive(node, 2, {}) == 'textbox#2 "Поиск"'
+
+
+def test_format_structure_prints_named_landmarks_only():
+    assert ax.format_structure(
+        {"role": {"value": "heading"}, "name": {"value": "Web accessibility"}}
+    ) == 'heading "Web accessibility"'
+    assert ax.format_structure(
+        {"role": {"value": "navigation"}, "name": {"value": ""}}
+    ) is None
+    assert ax.format_structure(
+        {"role": {"value": "paragraph"}, "name": {"value": "x"}}
+    ) is None

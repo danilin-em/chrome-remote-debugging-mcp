@@ -110,3 +110,42 @@ def unnamed_backend_ids(nodes: list[dict]) -> list[int]:
         if backend_id:
             out.append(backend_id)
     return out
+
+
+def _label(node: dict, attrs: dict[int, dict]) -> str:
+    """Best available label for an interactive node (R7)."""
+    name = node_name(node)
+    if name:
+        return f'"{name}"'
+    url = node_properties(node).get("url")
+    if url:
+        return f"-> {url}"
+    node_attrs = attrs.get(node.get("backendDOMNodeId")) or {}
+    for key in ATTR_FALLBACKS:
+        value = (node_attrs.get(key) or "").strip()
+        if value:
+            return f'"{value}"'
+    return "[unnamed]"
+
+
+def format_interactive(node: dict, ref: int, attrs: dict[int, dict]) -> str:
+    """Render one actionable node as ``role#ref "label" = "value" [flags]``."""
+    parts = [f"{node_role(node)}#{ref} {_label(node, attrs)}"]
+    value = node_value(node)
+    if value:
+        parts.append(f'= "{value}"')
+    properties = node_properties(node)
+    flags = [name for name in FLAG_PROPERTIES
+             if properties.get(name) not in (None, False, "false")]
+    if flags:
+        parts.append("[" + " ".join(flags) + "]")
+    return " ".join(parts)
+
+
+def format_structure(node: dict) -> str | None:
+    """Render a named landmark as ``role "name"``; ``None`` when not one (R10)."""
+    role = node_role(node)
+    name = node_name(node)
+    if role in STRUCTURE_ROLES and name:
+        return f'{role} "{name}"'
+    return None
