@@ -63,6 +63,19 @@ def test_strip_sources_tolerates_missing_names():
     assert nodes == [{"nodeId": "1"}, {"nodeId": "2", "name": None}]
 
 
+def test_strip_sources_leaves_other_sources_keys_alone():
+    """R11 near-miss: only ``name.sources`` is dropped. A ``value`` blob that
+    happens to carry its own ``sources`` key must survive untouched — the rule
+    targets ``name`` specifically, not every ``sources`` key anywhere in the
+    tree."""
+    nodes = [{"nodeId": "1",
+              "name": {"value": "x", "sources": ["a"]},
+              "value": {"value": "y", "sources": ["b"]}}]
+    ax.strip_sources(nodes)
+    assert "sources" not in nodes[0]["name"]
+    assert nodes[0]["value"]["sources"] == ["b"]
+
+
 def test_unnamed_backend_ids_finds_only_unlabelled_interactives(probe_nodes):
     ids = ax.unnamed_backend_ids(probe_nodes)
     assert isinstance(ids, list)
@@ -163,6 +176,16 @@ def test_render_drops_ignored_wrappers_and_root(probe_nodes):
     assert "RootWebArea" not in joined
     assert "generic" not in joined
     assert "InlineTextBox" not in joined
+
+
+def test_render_only_drops_the_literal_root_web_area_role():
+    """R5 near-miss: text whose *name* happens to be "RootWebArea" must still
+    render — the rule drops a node whose *role* is exactly "RootWebArea", not
+    anything that merely mentions it."""
+    nodes = [{"nodeId": "1", "role": {"value": "StaticText"},
+              "name": {"value": "RootWebArea"}}]
+    lines, _ = ax.render_nodes(nodes)
+    assert lines == ['text "RootWebArea"']
 
 
 def test_render_keeps_visible_content_of_the_probe_page(probe_nodes):

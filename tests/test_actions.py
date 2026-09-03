@@ -271,10 +271,15 @@ def test_settle_returns_as_soon_as_the_document_is_complete(monkeypatch):
 
 
 def test_settle_gives_up_quietly_when_the_document_never_completes(monkeypatch):
+    """Strengthened per the deferred minor in the final review: asserting only
+    ``rec.methods()`` is non-empty would pass for a poll-once-and-quit
+    ``settle``. Require at least two polls, matching the same proof used for
+    ``wait_for`` below (``test_wait_for_text_ignores_transient_errors_and_
+    still_times_out``), so the loop's retry behaviour is actually pinned."""
     rec = Recorder(replies={"Runtime.evaluate": {"result": {"value": "loading"}}})
     _install(monkeypatch, rec)
     asyncio.run(actions.settle(WS, timeout=0.05))
-    assert rec.methods()                      # it polled
+    assert len(rec.calls) >= 2                 # it kept polling, not just once
     # and it did not raise
 
 
