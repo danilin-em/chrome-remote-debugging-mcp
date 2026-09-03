@@ -60,22 +60,42 @@ filtered out by Chrome itself.
 url    https://news.ycombinator.com/
 title  Hacker News
 
-link#20 "Audacity 4.0"
-link#21 "github.com/audacity"
+link#1 -> https://news.ycombinator.com/
+link#2 "Hacker News"
+link#3 "new"
+link#4 "past"
+link#5 "comments"
+link#6 "ask"
+link#7 "show"
+link#8 "jobs"
+link#9 "submit"
+link#10 "login"
 
-text "by"
-link#22 "ClydeN"
-link#23 "hide"
-link#24 "10 comments"
+      link#11 -> https://news.ycombinator.com/vote?id=49548395&how=up&goto=news
+
+      link#12 "Audacity 4.0"
+      link#13 "github.com/audacity"
+
+      text "362 points"
+      text "by"
+      link#14 "ClydeN"
+      link#15 "2 hours ago"
+      link#16 "hide"
+      link#17 "80 comments"
 ```
 
-(a real, unedited `browse` view against the live front page. These two blocks
-— the story's title cell and its byline cell — sit at the *same* depth in
-Hacker News's table markup, so both are flush left here; the blank line alone
-marks the boundary between them. Deeper nesting elsewhere in a page indents
-further, one level per block of ancestry — see `block_path` in `ax.py`. The
-story, ref numbers and comment count will differ on any given run; the front
-page changes constantly.)
+(a real, unedited `browse` view captured live against the front page.
+Numbering and printing order follow document order, not Chrome's
+breadth-first `Accessibility.getFullAXTree` array, so the site header's nine
+navigation links print first — refs `#1`-`#10` — and only then the front
+page's first story. That story sits one level inside Hacker News's table
+markup: its vote arrow, its title/domain pair, and its points/byline pair are
+three sibling blocks at the same depth, so all three are indented equally and
+separated only by blank lines — the blank line alone marks the boundary
+between them. Deeper nesting elsewhere in a page indents further, one level
+per block of ancestry — see `block_path` in `ax.py`. The story, ref numbers
+and comment count will differ on any given run; the front page changes
+constantly.)
 
 A blank line separates blocks and indentation shows nesting. Every interactive
 element Chrome can address carries a `#N` ref (the rare element with no backend

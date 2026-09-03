@@ -347,7 +347,13 @@ def test_render_survives_a_broken_parent_link():
     assert lines == ['text "orphan"']
 
 
-def test_render_real_pages_produce_refs_and_no_unresolved_labels(ax_fixture):
+def test_render_finds_resolvable_refs_on_real_pages(ax_fixture):
+    """Renamed from ...and_no_unresolved_labels (M11): that name promised a
+    guarantee the test never checked, and it would in fact be false — Hacker
+    News's bottom search box has no name, no url and no matching DOM attribute
+    in the captured tree, so it renders exactly one `[unnamed]` line. What is
+    actually true, and what this test checks, is that every ref printed in the
+    text has a matching entry in the refs map and vice versa."""
     for name in ("hn", "youtube", "wikipedia"):
         frames = ax_fixture(name)
         lines, refs = ax.render_nodes(frames[0]["nodes"])
@@ -367,3 +373,110 @@ def test_render_real_pages_produce_refs_and_no_unresolved_labels(ax_fixture):
         )
         assert len(refs) >= 50, f"{name} produced only {len(refs)} refs, expected >= 50"
         assert lines, f"{name} produced no lines"
+
+
+def test_render_labels_everything_it_can_and_names_what_it_cannot(ax_fixture):
+    """The true claim the old test's name only implied: R7's attribute fallback
+    resolves every interactive node's label on YouTube and Wikipedia, and all
+    but one on Hacker News (the bottom search box), which still renders with a
+    resolvable ref rather than being silently dropped."""
+    hn_lines, _ = ax.render_nodes(ax_fixture("hn")[0]["nodes"])
+    unnamed = [l for l in hn_lines if "[unnamed]" in l]
+    assert len(unnamed) == 1, f"expected exactly one [unnamed] line on hn, got {unnamed}"
+
+    for name in ("youtube", "wikipedia"):
+        lines, _ = ax.render_nodes(ax_fixture(name)[0]["nodes"])
+        assert not any("[unnamed]" in l for l in lines), f"{name} has an unresolved label"
+
+
+# --- C1: document order, not tree-level order (see document_order docstring) -
+
+def test_document_order_walks_depth_first_not_level_by_level():
+    """``Accessibility.getFullAXTree`` returns nodes breadth-first: every node
+    at depth *n* precedes every node at depth *n+1*. A level-ordered walk of
+    this tree would yield root, a, b, a1 (b before a's own child); document
+    order must instead descend into ``a`` before moving on to its sibling
+    ``b``."""
+    nodes = [
+        {"nodeId": "root", "childIds": ["a", "b"]},
+        {"nodeId": "a", "parentId": "root", "childIds": ["a1"]},
+        {"nodeId": "b", "parentId": "root"},
+        {"nodeId": "a1", "parentId": "a"},
+    ]
+    by_id = {n["nodeId"]: n for n in nodes}
+    ordered = [n["nodeId"] for n in ax.document_order(nodes, by_id)]
+    assert ordered == ["root", "a", "a1", "b"]
+
+
+def test_document_order_terminates_on_a_child_id_cycle():
+    """A cycle in ``childIds`` must terminate the walk, not hang the renderer."""
+    nodes = [
+        {"nodeId": "a", "childIds": ["b"]},
+        {"nodeId": "b", "parentId": "a", "childIds": ["a"]},
+    ]
+    by_id = {n["nodeId"]: n for n in nodes}
+    ordered = [n["nodeId"] for n in ax.document_order(nodes, by_id)]
+    assert ordered == ["a", "b"]
+
+
+def test_document_order_keeps_a_cycle_unreachable_from_any_root():
+    """Every node here points to another node present in ``by_id``, so neither
+    qualifies as a root under the missing/dangling-``parentId`` rule — they
+    must still be emitted, not silently dropped, and the cycle guard must
+    still stop the walk that finds them."""
+    nodes = [
+        {"nodeId": "x", "parentId": "y", "childIds": ["y"]},
+        {"nodeId": "y", "parentId": "x", "childIds": ["x"]},
+    ]
+    by_id = {n["nodeId"]: n for n in nodes}
+    ordered = {n["nodeId"] for n in ax.document_order(nodes, by_id)}
+    assert ordered == {"x", "y"}
+
+
+def test_document_order_appends_unreachable_orphans_in_original_order():
+    nodes = [
+        {"nodeId": "root", "childIds": ["c1"]},
+        {"nodeId": "c1", "parentId": "root"},
+        {"nodeId": "orphan-a", "parentId": "missing"},
+        {"nodeId": "orphan-b", "parentId": "missing"},
+    ]
+    by_id = {n["nodeId"]: n for n in nodes}
+    ordered = [n["nodeId"] for n in ax.document_order(nodes, by_id)]
+    assert ordered == ["root", "c1", "orphan-a", "orphan-b"]
+
+
+def test_render_orders_hn_by_document_not_by_tree_level(ax_fixture):
+    """Regression for C1. Confirmed on the real capture before this fix: the
+    footer link "Guidelines" sat at array index 19, the first story title at
+    355, and the first "points" text at 161 — the view printed the footer
+    before the header, and a story's own score hundreds of lines from its
+    title. Pinned against the real fixture, not synthetic nodes: that gap is
+    exactly what let the bug survive eleven task reviews and a 100%-covered
+    suite.
+    """
+    lines, _ = ax.render_nodes(ax_fixture("hn")[0]["nodes"])
+
+    header_idx = next(i for i, l in enumerate(lines) if '"Hacker News"' in l)
+    footer_idx = next(i for i, l in enumerate(lines) if '"Guidelines"' in l)
+    assert header_idx < 10, "the site header must be near the top of the view"
+    assert header_idx < footer_idx, "the header must render before the footer"
+
+    title_idx = next(i for i, l in enumerate(lines)
+                     if '"Pre-Release of Polars 2.0"' in l)
+    points_idx = next(i for i, l in enumerate(lines) if "points" in l)
+    age_idx = next(i for i, l in enumerate(lines) if ' ago"' in l)
+    assert title_idx < points_idx < title_idx + 10, (
+        "a story's own score must render in the same block region as its title"
+    )
+    assert title_idx < age_idx < title_idx + 10, (
+        "a story's own timestamp must render in the same block region as its title"
+    )
+
+
+def test_render_ref_counts_survive_the_ordering_fix(ax_fixture):
+    """Reordering must not create or drop any interactive node — same content,
+    different order. Pinned to the counts measured before this fix (226, 713)."""
+    _, hn_refs = ax.render_nodes(ax_fixture("hn")[0]["nodes"])
+    _, wiki_refs = ax.render_nodes(ax_fixture("wikipedia")[0]["nodes"])
+    assert len(hn_refs) == 226
+    assert len(wiki_refs) == 713

@@ -151,6 +151,50 @@ def format_structure(node: dict) -> str | None:
     return None
 
 
+def document_order(nodes: list[dict], by_id: dict[str, dict]) -> list[dict]:
+    """Reorder a level-ordered AX array into document (pre-order) order.
+
+    ``Accessibility.getFullAXTree`` returns its nodes breadth-first: every node
+    at depth *n* precedes every node at depth *n+1*. Rendering that array
+    directly orders the view by tree depth rather than by the page's layout, so
+    a Hacker News story's title and its own score land hundreds of lines apart
+    and the footer prints before the header. Walking ``childIds`` from the roots
+    restores the order a reader sees (D6).
+
+    Purely in-memory: no I/O, like everything else here. Nodes that no root can
+    reach — orphans, or a ``parentId`` pointing at a node the capture dropped —
+    are appended in their original order rather than silently lost, and a
+    ``visited`` set makes a cycle in ``childIds`` terminate instead of hang.
+    """
+    visited: set[str] = set()
+    ordered: list[dict] = []
+
+    def walk(node: dict) -> None:
+        # Iterative, so a deeply nested page cannot exhaust the interpreter's
+        # stack the way recursion would.
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            node_id = current["nodeId"]
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+            ordered.append(current)
+            children = [by_id[child_id]
+                        for child_id in reversed(current.get("childIds") or [])
+                        if child_id in by_id]
+            stack.extend(children)
+
+    for node in nodes:
+        parent_id = node.get("parentId")
+        if parent_id is None or parent_id not in by_id:
+            walk(node)
+    for node in nodes:
+        if node["nodeId"] not in visited:
+            walk(node)
+    return ordered
+
+
 def block_path(node: dict, by_id: dict[str, dict]) -> tuple[str, ...]:
     """Ids of the node's block ancestors, outermost first (R12).
 
@@ -216,9 +260,14 @@ def render_nodes(
 ) -> tuple[list[str], dict[int, int]]:
     """Render one frame's accessibility nodes as view lines.
 
-    Returns the lines and ``{ref: backend_node_id}``. Refs continue from
-    ``ref_start``; when ``refs`` is given it is updated in place and returned,
-    so a caller can number a whole page across several frames.
+    Nodes are emitted in document order (see :func:`document_order`), not in
+    the depth-first-by-level order CDP hands back, so the view reproduces the
+    page's own layout.
+
+    Returns the lines and ``{ref: backend_node_id}``. Refs are numbered in the
+    order they appear in the emitted view and continue from ``ref_start``; when
+    ``refs`` is given it is updated in place and returned, so a caller can
+    number a whole page across several frames.
     """
     refs = refs if refs is not None else {}
     attrs = attrs or {}
@@ -226,7 +275,7 @@ def render_nodes(
 
     items: list[tuple[tuple[str, ...], str]] = []
     ref = ref_start
-    for node in nodes:
+    for node in document_order(nodes, by_id):
         line, ref, backend_id = _content_line(node, by_id, attrs, ref)
         if line is None:
             continue
