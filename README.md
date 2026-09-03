@@ -121,6 +121,16 @@ earlier in the page shifts every later number. Refs from an older view are
 rejected with a `stale` or `not in the current view` error rather than clicking
 the wrong thing. Take a new view and use its numbers.
 
+**Refs in a child frame can be seen but not acted on.** The view is built from
+every frame — including cross-origin iframes, which a JavaScript DOM walk
+cannot reach at all — so an element inside one still gets a `#N` ref and
+prints in the view. But every action is dispatched against the page target's
+own websocket, which only ever reaches the main frame's renderer; a node in a
+same- or cross-origin child frame lives in a different coordinate space (and,
+cross-origin, a different renderer process) this tool has no way to address.
+Acting on such a ref is refused with an explicit "not the main frame" error
+rather than being sent anyway to fail later as a misleading stale ref.
+
 For a page whose content arrives after load — most single-page applications —
 `browse` waits for the document, not for the content. Use an explicit
 `wait_for` step.

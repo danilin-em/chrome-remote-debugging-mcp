@@ -290,13 +290,16 @@ def test_main_stops_tunnel_even_when_run_raises(monkeypatch):
 # --- browse / browse_view / browse_act -------------------------------------
 
 def _stub_browse(monkeypatch, view="url    http://a/\ntitle  T\n\nbutton#1 \"Жми\"",
-                 refs=1, steps=None, error=None, snapshot_exc=None):
+                 refs=1, url="http://a/", steps=None, error=None,
+                 snapshot_exc=None, run_actions_exc=None):
     async def fake_snapshot(ws_url, tab_id):
         if snapshot_exc is not None:
             raise snapshot_exc
-        return view, refs
+        return view, refs, url
 
     async def fake_run_actions(ws_url, tab_id, action_list):
+        if run_actions_exc is not None:
+            raise run_actions_exc
         return steps if steps is not None else [], error
 
     monkeypatch.setattr(server.browse_engine, "snapshot", fake_snapshot)
@@ -316,6 +319,21 @@ def test_browse_navigates_then_returns_the_view(monkeypatch):
     assert out["url"] == "http://a/"
     assert out["refs"] == 1
     assert 'button#1 "Жми"' in out["view"]
+
+
+def test_browse_returns_the_post_navigation_url_not_the_requested_one(monkeypatch):
+    """M10: the url comes from what the snapshot itself observed
+    (location.href after any redirect), not merely the requested url echoed
+    back."""
+    _stub(monkeypatch, targets=[PAGE], send_result={})
+    _stub_browse(monkeypatch, url="http://a/redirected")
+
+    async def fake_settle(ws_url, timeout=2.0):
+        return None
+
+    monkeypatch.setattr(server.actions, "settle", fake_settle)
+    out = asyncio.run(_fn(server.browse)("http://a/"))
+    assert out["url"] == "http://a/redirected"
 
 
 def test_browse_reports_an_unreachable_chrome(monkeypatch):
@@ -406,3 +424,14 @@ def test_browse_act_reports_a_snapshot_failure_after_acting(monkeypatch):
     out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}]))
     assert "snapshot failed" in out["error"]
     assert out["steps"] == [{"do": "click", "ok": True}]
+
+
+def test_browse_act_reports_an_action_batch_failure(monkeypatch):
+    """I5: run_actions was previously called unguarded inside browse_act, a
+    latent breach of the never-raise contract — wrap it the way snapshot
+    already is."""
+    _stub(monkeypatch, targets=[PAGE], send_result={})
+    _stub_browse(monkeypatch, run_actions_exc=RuntimeError("registry corrupted"))
+    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}]))
+    assert out["tab_id"] == "T1"
+    assert out["error"] == "action batch failed: registry corrupted"

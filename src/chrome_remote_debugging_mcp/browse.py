@@ -8,15 +8,56 @@ replaces its tab's registry wholesale.
 
 from __future__ import annotations
 
+import asyncio
+from typing import NamedTuple
+
 from . import actions, ax, cdp
 
-# {tab_id: {ref: (frame_id, backend_node_id)}}
-REGISTRY: dict[str, dict[int, tuple[str, int]]] = {}
+
+class _Snapshot(NamedTuple):
+    """Everything a tab's most recent snapshot needs to validate a later batch.
+
+    ``refs`` maps a ref to the ``(frame_id, backend_node_id)`` it resolved to.
+    ``main_frame_id`` lets an action honestly refuse a ref that lives in a
+    child frame (I2): every action goes to the page-target websocket, which
+    only ever addresses the main frame's renderer, so a node in another frame
+    cannot actually be clicked from here. ``loader_id`` is the main frame's
+    ``Page.Frame.loaderId`` at snapshot time; a cross-process navigation
+    restarts Blink's backend-id numbering from 1, so an old ref can otherwise
+    resolve to a live, unrelated node in the new document (I3) — a batch is
+    refused when the tab's current loaderId no longer matches this stamp.
+    """
+
+    refs: dict[int, tuple[str, int]]
+    main_frame_id: str
+    loader_id: str | None
+
+
+# {tab_id: _Snapshot}
+REGISTRY: dict[str, _Snapshot] = {}
+
+# Per-tab locks serialising snapshot assembly (I4): two concurrent
+# browse/browse_view calls on one tab must not race to replace REGISTRY[tab_id]
+# — whichever registry-write lands last would silently invalidate the refs just
+# handed to the caller whose write didn't. Keyed per tab, never global, so
+# unrelated tabs never wait on each other. Entries are never pruned, like
+# REGISTRY itself — see the note in CLAUDE.md.
+_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _lock_for(tab_id: str) -> asyncio.Lock:
+    """This tab's snapshot lock, created on first use."""
+    lock = _LOCKS.get(tab_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _LOCKS[tab_id] = lock
+    return lock
 
 
 def registry_for(tab_id: str) -> dict[int, tuple[str, int]]:
     """Refs from this tab's most recent snapshot; empty when there is none."""
-    return REGISTRY.get(tab_id, {})
+    state = REGISTRY.get(tab_id)
+    return state.refs if state is not None else {}
 
 
 def _frame_ids(frame_tree: dict) -> list[str]:
@@ -59,57 +100,91 @@ async def _attributes_for(ws_url: str, backend_ids: list[int]) -> dict[int, dict
     return attrs
 
 
-async def snapshot(ws_url: str, tab_id: str) -> tuple[str, int]:
-    """Render the whole page — every frame — and refresh the tab's registry."""
-    frame_tree = await cdp.send(ws_url, "Page.getFrameTree")
-    frame_ids = _frame_ids(frame_tree)
-    url, title = await _page_header(ws_url)
+async def snapshot(ws_url: str, tab_id: str) -> tuple[str, int, str]:
+    """Render the whole page — every frame — and refresh the tab's registry.
 
-    lines = [f"url    {url}", f"title  {title}", ""]
-    registry: dict[int, tuple[str, int]] = {}
-    ref_count = 0
+    Returns ``(view, ref_count, url)``, where ``url`` is the location the
+    snapshot actually observed (``location.href`` at capture time), which can
+    differ from a URL a caller navigated to when the page redirected (M10).
 
-    for index, frame_id in enumerate(frame_ids):
-        tree = await cdp.send(ws_url, "Accessibility.getFullAXTree",
-                              {"frameId": frame_id})
-        nodes = tree.get("nodes", [])
-        ax.strip_sources(nodes)
-        attrs = await _attributes_for(ws_url, ax.unnamed_backend_ids(nodes))
-        frame_lines, frame_refs = ax.render_nodes(nodes, ref_count, attrs=attrs)
-        if not frame_lines:
-            continue
-        if index > 0:
-            lines.append(f"frame {frame_id[:8]}")
-        lines.extend(frame_lines)
-        for ref, backend_id in frame_refs.items():
-            registry[ref] = (frame_id, backend_id)
-        ref_count += len(frame_refs)
+    Runs under this tab's lock (I4) so two concurrent snapshots of the same
+    tab cannot interleave and leave the registry holding a mix of both.
+    """
+    async with _lock_for(tab_id):
+        frame_tree = await cdp.send(ws_url, "Page.getFrameTree")
+        frame_ids = _frame_ids(frame_tree)
+        main_frame_id = frame_ids[0]
+        loader_id = frame_tree["frameTree"]["frame"].get("loaderId")
+        url, title = await _page_header(ws_url)
 
-    REGISTRY[tab_id] = registry
-    return "\n".join(lines), len(registry)
+        lines = [f"url    {url}", f"title  {title}", ""]
+        registry: dict[int, tuple[str, int]] = {}
+        ref_count = 0
+
+        for index, frame_id in enumerate(frame_ids):
+            tree = await cdp.send(ws_url, "Accessibility.getFullAXTree",
+                                  {"frameId": frame_id})
+            nodes = tree.get("nodes", [])
+            ax.strip_sources(nodes)
+            attrs = await _attributes_for(ws_url, ax.unnamed_backend_ids(nodes))
+            frame_lines, frame_refs = ax.render_nodes(nodes, ref_count, attrs=attrs)
+            if not frame_lines:
+                continue
+            if index > 0:
+                # A blank line before the marker (M6): without it, a frame
+                # marker collides with the previous frame's last content line
+                # instead of reading as its own boundary, like every other
+                # block transition in the view (D7).
+                if lines and lines[-1] != "":
+                    lines.append("")
+                lines.append(f"frame {frame_id[:8]}")
+            lines.extend(frame_lines)
+            for ref, backend_id in frame_refs.items():
+                registry[ref] = (frame_id, backend_id)
+            ref_count += len(frame_refs)
+
+        REGISTRY[tab_id] = _Snapshot(refs=registry, main_frame_id=main_frame_id,
+                                     loader_id=loader_id)
+        return "\n".join(lines), len(registry), url
 
 
 # Verbs that address an element and therefore require a resolvable ref.
 _NEEDS_REF = frozenset({"click", "type", "select", "check", "uncheck", "hover"})
 
 
-def _resolve(registry: dict[int, tuple[str, int]], ref) -> int:
-    """Backend id behind a ref, or raise with an agent-readable reason."""
+def _resolve(state: _Snapshot, ref) -> int:
+    """Backend id behind a ref, or raise with an agent-readable reason.
+
+    A ref that resolved in a frame other than the main frame is refused
+    outright (I2): every action here is dispatched against the page target's
+    own websocket, which can only ever reach the main frame's renderer — a
+    node from a same- or cross-origin child frame lives in a different
+    coordinate space (and, for a cross-origin frame, a different renderer
+    process) that this tool has no way to address. Refusing honestly, rather
+    than trying and reporting a misleading "stale ref", is the fix — not
+    coordinate offsetting or a per-frame socket (out of scope; see the design
+    document).
+    """
     if ref is None:
         raise actions.ActionError("this action needs a ref")
-    if ref not in registry:
+    if ref not in state.refs:
         raise actions.ActionError(
             f"ref {ref} is not in the current view; take a new snapshot"
         )
-    return registry[ref][1]
+    frame_id, backend_id = state.refs[ref]
+    if frame_id != state.main_frame_id:
+        raise actions.ActionError(
+            f"ref {ref} is in frame {frame_id[:8]}, not the main frame; "
+            "actions on nodes in other frames are not supported"
+        )
+    return backend_id
 
 
-async def _perform(ws_url: str, registry: dict[int, tuple[str, int]],
-                   action: dict) -> str | None:
+async def _perform(ws_url: str, state: _Snapshot, action: dict) -> str | None:
     """Run one action. Returns an optional detail string for the step result."""
     verb = action.get("do")
     ref = action.get("ref")
-    backend_id = _resolve(registry, ref) if verb in _NEEDS_REF else None
+    backend_id = _resolve(state, ref) if verb in _NEEDS_REF else None
 
     if verb == "click":
         await actions.click(ws_url, ref, backend_id)
@@ -135,7 +210,7 @@ async def _perform(ws_url: str, registry: dict[int, tuple[str, int]],
         # "to"), but a *supplied* ref must resolve through the same guard
         # every other verb uses — an unknown ref must raise, not be treated
         # as if no ref were given at all.
-        scroll_backend = _resolve(registry, scroll_ref) if scroll_ref is not None else None
+        scroll_backend = _resolve(state, scroll_ref) if scroll_ref is not None else None
         await actions.scroll(ws_url, scroll_ref, scroll_backend, action.get("to"))
         return None
     if verb == "hover":
@@ -150,11 +225,17 @@ async def _perform(ws_url: str, registry: dict[int, tuple[str, int]],
             raise actions.ActionError(
                 "wait_for takes either text or ref_gone, not both"
             )
-        gone_backend = _resolve(registry, gone) if gone is not None else None
+        gone_backend = _resolve(state, gone) if gone is not None else None
         await actions.wait_for(ws_url, text, gone, gone_backend,
                                float(action.get("timeout", 5.0)))
         return None
     raise actions.ActionError(f'unknown action "{verb}"')
+
+
+async def _current_loader_id(ws_url: str) -> str | None:
+    """The main frame's ``loaderId`` right now, straight from Chrome."""
+    frame_tree = await cdp.send(ws_url, "Page.getFrameTree")
+    return frame_tree["frameTree"]["frame"].get("loaderId")
 
 
 async def run_actions(ws_url: str, tab_id: str,
@@ -165,15 +246,28 @@ async def run_actions(ws_url: str, tab_id: str,
     whose state is no longer understood. Returns the per-step results and the
     error that stopped it, or ``None``.
     """
-    registry = REGISTRY.get(tab_id)
-    if registry is None:
+    state = REGISTRY.get(tab_id)
+    if state is None:
         return [], "no view for this tab; call browse or browse_view first"
+
+    # I3: a cross-process navigation restarts Blink's backendNodeId numbering
+    # from 1, so an old ref can resolve to a live, unrelated node instead of
+    # failing as stale. Reachable in ordinary use — a browse whose snapshot
+    # failed leaves the prior registry in place, navigate can run between
+    # browse_view and browse_act, or a person switches the tab by hand — so
+    # every batch re-checks the stamp taken at snapshot time before acting.
+    try:
+        current_loader_id = await _current_loader_id(ws_url)
+    except Exception as exc:
+        return [], f"could not verify the page is unchanged: {exc}"
+    if current_loader_id != state.loader_id:
+        return [], "the page has navigated since this view; take a new snapshot"
 
     steps: list[dict] = []
     for action in action_list:
         verb = action.get("do")
         try:
-            detail = await _perform(ws_url, registry, action)
+            detail = await _perform(ws_url, state, action)
         except actions.ActionError as exc:
             steps.append({"do": verb, "ok": False, "error": str(exc)})
             return steps, str(exc)

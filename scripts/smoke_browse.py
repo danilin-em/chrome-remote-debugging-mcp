@@ -41,7 +41,7 @@ async def main() -> None:
     await actions.settle(ws_url, timeout=10.0)
     await asyncio.sleep(2)
 
-    view, refs = await browse.snapshot(ws_url, tab_id)
+    view, refs, _ = await browse.snapshot(ws_url, tab_id)
     print(f"view: {len(view.splitlines())} lines, ~{len(view) // 4} tokens, {refs} refs")
     print("\n".join(view.splitlines()[:12]))
 
@@ -59,7 +59,7 @@ async def main() -> None:
     print("steps:", steps, "error:", error)
     await asyncio.sleep(2)
 
-    view2, refs2 = await browse.snapshot(ws_url, tab_id)
+    view2, refs2, _ = await browse.snapshot(ws_url, tab_id)
     print(f"after: {len(view2.splitlines())} lines, {refs2} refs")
     print(view2.splitlines()[0])
 

@@ -234,10 +234,12 @@ async def browse(url: str, tab_id: str | None = None) -> dict:
 
     await actions.settle(ws_url, timeout=10.0)
     try:
-        view, refs = await browse_engine.snapshot(ws_url, target.get("id"))
+        view, refs, observed_url = await browse_engine.snapshot(ws_url, target.get("id"))
     except Exception as exc:
         return {"error": f"snapshot failed: {exc}"}
-    return {"tab_id": target.get("id"), "url": url, "view": view, "refs": refs}
+    # The post-navigation url the snapshot itself observed (M10), which can
+    # differ from the requested url after a redirect.
+    return {"tab_id": target.get("id"), "url": observed_url, "view": view, "refs": refs}
 
 
 @mcp.tool()
@@ -252,7 +254,7 @@ async def browse_view(tab_id: str | None = None) -> dict:
     except _TargetError as exc:
         return {"error": str(exc)}
     try:
-        view, refs = await browse_engine.snapshot(ws_url, target.get("id"))
+        view, refs, _ = await browse_engine.snapshot(ws_url, target.get("id"))
     except Exception as exc:
         return {"error": f"snapshot failed: {exc}"}
     return {"tab_id": target.get("id"), "view": view, "refs": refs}
@@ -287,9 +289,16 @@ async def browse_act(actions_list: list[dict], tab_id: str | None = None) -> dic
         return {"error": str(exc)}
 
     tab = target.get("id")
-    steps, error = await browse_engine.run_actions(ws_url, tab, actions_list)
     try:
-        view, refs = await browse_engine.snapshot(ws_url, tab)
+        steps, error = await browse_engine.run_actions(ws_url, tab, actions_list)
+    except Exception as exc:
+        # I5: run_actions was previously called unguarded — a latent breach of
+        # the never-raise contract (unreachable today only because FastMCP's
+        # own validation happens to keep it that way). Wrap it the same way
+        # snapshot already is below.
+        return {"tab_id": tab, "error": f"action batch failed: {exc}"}
+    try:
+        view, refs, _ = await browse_engine.snapshot(ws_url, tab)
     except Exception as exc:
         return {"tab_id": tab, "steps": steps, "error": f"snapshot failed: {exc}"}
 
