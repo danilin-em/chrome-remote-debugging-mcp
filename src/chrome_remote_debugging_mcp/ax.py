@@ -235,5 +235,5 @@ def render_nodes(
         if previous is not None and path != previous:
             lines.append("")
         previous = path
-        lines.append("  " * max(0, len(path) - base) + line)
+        lines.append("  " * (len(path) - base) + line)
     return lines, refs

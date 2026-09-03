@@ -1,6 +1,13 @@
 """Rendering rules R1-R12, tested against captured accessibility trees."""
 
+import re
+
 import chrome_remote_debugging_mcp.ax as ax
+
+# Matches only the "role#ref " token `format_interactive` puts at the start of
+# a rendered line (after any block indentation) — not an incidental "#123 "
+# that might appear inside a node's own label text.
+_REF_LINE_RE = re.compile(r"^\s*[A-Za-z]+#(\d+) ")
 
 
 def _named(nodes, name):
@@ -252,16 +259,45 @@ def test_render_prints_a_heading_line_and_opens_a_block():
     assert lines == ['heading "Title"', "", '  text "Body"']
 
 
+def test_block_path_skips_wrapper_ancestors_and_keeps_block_ones():
+    nodes = [
+        {"nodeId": "sec", "role": {"value": "region"}, "name": {"value": ""}},
+        {"nodeId": "lt", "role": {"value": "LayoutTable"}, "name": {"value": ""},
+         "parentId": "sec"},
+        {"nodeId": "ltr", "role": {"value": "LayoutTableRow"}, "name": {"value": ""},
+         "parentId": "lt"},
+        {"nodeId": "cell", "role": {"value": "cell"}, "name": {"value": ""},
+         "parentId": "ltr"},
+        {"nodeId": "t", "role": {"value": "StaticText"}, "name": {"value": "x"},
+         "parentId": "cell"},
+    ]
+    by_id = {n["nodeId"]: n for n in nodes}
+    # "lt" and "ltr" are wrapper roles and must not appear in the path; "sec"
+    # (region) and "cell" are block roles and must, outermost first.
+    assert ax.block_path(by_id["t"], by_id) == ("sec", "cell")
+
+
 def test_render_ignores_wrapper_ancestors_when_computing_indentation():
+    # Two items at genuinely different block depths: "flat" reaches its root
+    # through wrapper roles only (LayoutTable/LayoutTableRow), so its block
+    # path is empty and it must render at column 0; "nested" sits one level
+    # inside a real block role ("row"), so it must be indented by one level.
+    # A `block_path` that (wrongly) counted wrapper ancestors would instead
+    # put "flat" one level deeper than "nested" (path lengths 2 vs 1), which
+    # flips both the indentation and which side of the blank-line split each
+    # line lands on — so this fails under that bug.
     nodes = [
         {"nodeId": "lt", "role": {"value": "LayoutTable"}, "name": {"value": ""}},
         {"nodeId": "ltr", "role": {"value": "LayoutTableRow"}, "name": {"value": ""},
          "parentId": "lt"},
-        {"nodeId": "t", "role": {"value": "StaticText"}, "name": {"value": "flat"},
+        {"nodeId": "t1", "role": {"value": "StaticText"}, "name": {"value": "flat"},
          "parentId": "ltr"},
+        {"nodeId": "r1", "role": {"value": "row"}, "name": {"value": ""}},
+        {"nodeId": "t2", "role": {"value": "StaticText"}, "name": {"value": "nested"},
+         "parentId": "r1"},
     ]
     lines, _ = ax.render_nodes(nodes)
-    assert lines == ['text "flat"']
+    assert lines == ['text "flat"', "", '  text "nested"']
 
 
 def test_render_normalises_indentation_to_the_shallowest_content():
@@ -296,5 +332,14 @@ def test_render_real_pages_produce_refs_and_no_unresolved_labels(ax_fixture):
             assert any(f"#{ref} " in line for line in lines), (
                 f"{name} ref #{ref} is not reachable in the rendered text"
             )
+        text_refs = set()
+        for line in lines:
+            match = _REF_LINE_RE.match(line)
+            if match:
+                text_refs.add(int(match.group(1)))
+        orphans = text_refs - set(refs)
+        assert not orphans, (
+            f"{name} rendered ref number(s) {orphans} with no entry in the refs map"
+        )
         assert len(refs) >= 50, f"{name} produced only {len(refs)} refs, expected >= 50"
         assert lines, f"{name} produced no lines"
