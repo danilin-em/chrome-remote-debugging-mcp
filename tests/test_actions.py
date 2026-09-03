@@ -82,3 +82,169 @@ def test_resolve_box_propagates_transport_errors(monkeypatch):
     _install(monkeypatch, rec)
     with pytest.raises(OSError, match="Connection refused"):
         asyncio.run(actions.resolve_box(WS, 5, 77))
+
+
+def test_type_text_focuses_then_inserts(monkeypatch):
+    rec = Recorder(replies={"DOM.getBoxModel": BOX})
+    _install(monkeypatch, rec)
+    asyncio.run(actions.type_text(WS, 2, 77, "коты"))
+    assert rec.methods() == [
+        "DOM.scrollIntoViewIfNeeded", "DOM.getBoxModel",
+        "Input.dispatchMouseEvent", "Input.dispatchMouseEvent",
+        "Input.insertText",
+    ]
+    assert rec.calls[-1][1] == {"text": "коты"}
+
+
+def test_type_text_clears_the_field_first_when_asked(monkeypatch):
+    rec = Recorder(replies={"DOM.getBoxModel": BOX})
+    _install(monkeypatch, rec)
+    asyncio.run(actions.type_text(WS, 2, 77, "новое", clear=True))
+    methods = rec.methods()
+    assert "Input.dispatchKeyEvent" in methods
+    select_all = [p for m, p in rec.calls
+                  if m == "Input.dispatchKeyEvent" and p.get("commands")]
+    assert select_all and select_all[0]["commands"] == ["selectAll"]
+    assert methods[-1] == "Input.insertText"
+
+
+def test_press_sends_a_key_down_and_key_up(monkeypatch):
+    rec = Recorder()
+    _install(monkeypatch, rec)
+    asyncio.run(actions.press(WS, "Enter"))
+    assert rec.methods() == ["Input.dispatchKeyEvent", "Input.dispatchKeyEvent"]
+    down, up = rec.calls[0][1], rec.calls[1][1]
+    assert down["type"] == "keyDown" and up["type"] == "keyUp"
+    assert down["key"] == "Enter" and down["windowsVirtualKeyCode"] == 13
+
+
+def test_press_rejects_an_unknown_key(monkeypatch):
+    rec = Recorder()
+    _install(monkeypatch, rec)
+    with pytest.raises(actions.ActionError) as excinfo:
+        asyncio.run(actions.press(WS, "Meta+Shift+Wat"))
+    assert "unsupported key" in str(excinfo.value)
+
+
+def test_press_space_sends_its_single_char_text_on_key_down_only(monkeypatch):
+    """Enter's mapped text is multi-character, so it never exercises the
+    ``len(text) == 1`` arm of the text-building conditional; Space's mapped
+    text is a single space, so it takes that arm on keyDown and still sends
+    an empty string on keyUp."""
+    rec = Recorder()
+    _install(monkeypatch, rec)
+    asyncio.run(actions.press(WS, "Space"))
+    down, up = rec.calls[0][1], rec.calls[1][1]
+    assert down["type"] == "keyDown" and down["text"] == " "
+    assert up["type"] == "keyUp" and up["text"] == ""
+
+
+def test_select_sets_the_value_and_fires_events(monkeypatch):
+    rec = Recorder(replies={
+        "DOM.resolveNode": {"object": {"objectId": "OBJ1"}},
+        "Runtime.callFunctionOn": {"result": {"value": True}},
+    })
+    _install(monkeypatch, rec)
+    asyncio.run(actions.select(WS, 4, 77, "два"))
+    assert rec.methods() == ["DOM.resolveNode", "Runtime.callFunctionOn"]
+    params = rec.calls[1][1]
+    assert params["objectId"] == "OBJ1"
+    assert params["arguments"] == [{"value": "два"}]
+    assert "change" in params["functionDeclaration"]
+
+
+def test_select_reports_a_missing_option(monkeypatch):
+    rec = Recorder(replies={
+        "DOM.resolveNode": {"object": {"objectId": "OBJ1"}},
+        "Runtime.callFunctionOn": {"result": {"value": False}},
+    })
+    _install(monkeypatch, rec)
+    with pytest.raises(actions.ActionError) as excinfo:
+        asyncio.run(actions.select(WS, 4, 77, "нет такого"))
+    assert "no option" in str(excinfo.value)
+
+
+def test_select_reports_a_stale_ref(monkeypatch):
+    rec = Recorder(errors={"DOM.resolveNode": cdp.CDPError("Could not resolve node")})
+    _install(monkeypatch, rec)
+    with pytest.raises(actions.ActionError) as excinfo:
+        asyncio.run(actions.select(WS, 4, 77, "два"))
+    assert "ref 4 is stale" in str(excinfo.value)
+
+
+def test_select_propagates_transport_errors(monkeypatch):
+    """A dropped websocket must surface honestly, not as a stale-ref report."""
+    rec = Recorder(errors={"DOM.resolveNode": OSError("Connection refused")})
+    _install(monkeypatch, rec)
+    with pytest.raises(OSError, match="Connection refused"):
+        asyncio.run(actions.select(WS, 4, 77, "два"))
+
+
+def test_set_checked_clicks_only_when_the_state_differs(monkeypatch):
+    rec = Recorder(replies={
+        "DOM.resolveNode": {"object": {"objectId": "OBJ1"}},
+        "Runtime.callFunctionOn": {"result": {"value": False}},
+        "DOM.getBoxModel": BOX,
+    })
+    _install(monkeypatch, rec)
+    assert asyncio.run(actions.set_checked(WS, 9, 77, True)) is True
+    assert "Input.dispatchMouseEvent" in rec.methods()
+
+
+def test_set_checked_is_a_no_op_when_already_in_the_target_state(monkeypatch):
+    rec = Recorder(replies={
+        "DOM.resolveNode": {"object": {"objectId": "OBJ1"}},
+        "Runtime.callFunctionOn": {"result": {"value": True}},
+    })
+    _install(monkeypatch, rec)
+    assert asyncio.run(actions.set_checked(WS, 9, 77, True)) is False
+    assert "Input.dispatchMouseEvent" not in rec.methods()
+
+
+def test_scroll_to_a_ref_uses_scroll_into_view(monkeypatch):
+    rec = Recorder()
+    _install(monkeypatch, rec)
+    asyncio.run(actions.scroll(WS, 3, 77, None))
+    assert rec.methods() == ["DOM.scrollIntoViewIfNeeded"]
+
+
+def test_scroll_to_bottom_and_top_use_the_wheel(monkeypatch):
+    rec = Recorder()
+    _install(monkeypatch, rec)
+    asyncio.run(actions.scroll(WS, None, None, "bottom"))
+    asyncio.run(actions.scroll(WS, None, None, "top"))
+    assert rec.methods() == ["Input.dispatchMouseEvent", "Input.dispatchMouseEvent"]
+    assert rec.calls[0][1]["deltaY"] > 0
+    assert rec.calls[1][1]["deltaY"] < 0
+
+
+def test_scroll_rejects_an_unknown_direction(monkeypatch):
+    rec = Recorder()
+    _install(monkeypatch, rec)
+    with pytest.raises(actions.ActionError) as excinfo:
+        asyncio.run(actions.scroll(WS, None, None, "sideways"))
+    assert "scroll target" in str(excinfo.value)
+
+
+def test_scroll_reports_a_stale_ref(monkeypatch):
+    rec = Recorder(errors={"DOM.scrollIntoViewIfNeeded": cdp.CDPError("Node is detached")})
+    _install(monkeypatch, rec)
+    with pytest.raises(actions.ActionError) as excinfo:
+        asyncio.run(actions.scroll(WS, 3, 77, None))
+    assert "ref 3 is stale" in str(excinfo.value)
+
+
+def test_scroll_propagates_transport_errors(monkeypatch):
+    """A dropped websocket must surface honestly, not as a stale-ref report."""
+    rec = Recorder(errors={"DOM.scrollIntoViewIfNeeded": OSError("Connection refused")})
+    _install(monkeypatch, rec)
+    with pytest.raises(OSError, match="Connection refused"):
+        asyncio.run(actions.scroll(WS, 3, 77, None))
+
+
+def test_hover_moves_the_mouse_without_clicking(monkeypatch):
+    rec = Recorder(replies={"DOM.getBoxModel": BOX})
+    _install(monkeypatch, rec)
+    asyncio.run(actions.hover(WS, 3, 77))
+    assert rec.methods()[-1] == "Input.dispatchMouseEvent"
+    assert rec.calls[-1][1]["type"] == "mouseMoved"
