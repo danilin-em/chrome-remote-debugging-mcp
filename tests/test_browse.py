@@ -358,6 +358,99 @@ def test_run_actions_resolves_a_scroll_targeted_by_ref(monkeypatch):
     assert seen == {"ref": 1, "backend_id": 201, "to": None}
 
 
+def test_run_actions_rejects_an_unknown_scroll_ref(monkeypatch):
+    """CONTROLLER RULING (fix round 1, Finding 3): a supplied-but-unknown
+    scroll ref must raise the same "not in the current view" error every
+    other verb gives, not fall through to actions.scroll's generic "must be
+    a ref, or to top/bottom" message as though no ref had been given at all.
+
+    Proven deterministically: actions.scroll is spied on and must never be
+    called.
+    """
+    calls = []
+
+    async def spy_scroll(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(browse.actions, "scroll", spy_scroll)
+    _prime()
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [
+        {"do": "scroll", "ref": 99},
+    ]))
+    assert "ref 99 is not in the current view" in error
+    assert steps[0]["ok"] is False
+    assert calls == []
+
+
+def test_run_actions_passes_press_its_key(monkeypatch):
+    seen = {}
+
+    async def fake_press(ws_url, key):
+        seen.update(ws_url=ws_url, key=key)
+
+    monkeypatch.setattr(browse.actions, "press", fake_press)
+    monkeypatch.setattr(browse.actions, "settle", lambda *a, **k: asyncio.sleep(0))
+    _prime()
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [
+        {"do": "press", "key": "Enter"},
+    ]))
+    assert error is None
+    assert seen == {"ws_url": WS, "key": "Enter"}
+
+
+def test_run_actions_passes_select_its_ref_backend_id_and_value(monkeypatch):
+    seen = {}
+
+    async def fake_select(ws_url, ref, backend_id, value):
+        seen.update(ws_url=ws_url, ref=ref, backend_id=backend_id, value=value)
+
+    monkeypatch.setattr(browse.actions, "select", fake_select)
+    monkeypatch.setattr(browse.actions, "settle", lambda *a, **k: asyncio.sleep(0))
+    _prime()
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [
+        {"do": "select", "ref": 2, "value": "два"},
+    ]))
+    assert error is None
+    assert seen == {"ws_url": WS, "ref": 2, "backend_id": 202, "value": "два"}
+
+
+def test_run_actions_passes_hover_its_ref_and_backend_id(monkeypatch):
+    seen = {}
+
+    async def fake_hover(ws_url, ref, backend_id):
+        seen.update(ws_url=ws_url, ref=ref, backend_id=backend_id)
+
+    monkeypatch.setattr(browse.actions, "hover", fake_hover)
+    monkeypatch.setattr(browse.actions, "settle", lambda *a, **k: asyncio.sleep(0))
+    _prime()
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [
+        {"do": "hover", "ref": 2},
+    ]))
+    assert error is None
+    assert seen == {"ws_url": WS, "ref": 2, "backend_id": 202}
+
+
+def test_run_actions_passes_check_and_uncheck_distinct_targets(monkeypatch):
+    """Fix round 1, Finding 2: the `target` boolean is the piece most likely
+    to be inverted by a careless edit — assert it differs between "check"
+    and "uncheck", along with the ref/backend_id actually forwarded."""
+    seen = []
+
+    async def fake_set_checked(ws_url, ref, backend_id, target):
+        seen.append((ws_url, ref, backend_id, target))
+        return False
+
+    monkeypatch.setattr(browse.actions, "set_checked", fake_set_checked)
+    monkeypatch.setattr(browse.actions, "settle", lambda *a, **k: asyncio.sleep(0))
+    _prime()
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [
+        {"do": "check", "ref": 1},
+        {"do": "uncheck", "ref": 2},
+    ]))
+    assert error is None
+    assert seen == [(WS, 1, 201, True), (WS, 2, 202, False)]
+
+
 def test_run_actions_passes_wait_for_a_resolved_ref(monkeypatch):
     seen = {}
 
@@ -377,24 +470,48 @@ def test_run_actions_passes_wait_for_a_resolved_ref(monkeypatch):
 def test_run_actions_rejects_wait_for_with_an_unknown_ref_gone(monkeypatch):
     """CONTROLLER RULING 1: an unknown ref_gone must raise through _resolve,
     not silently resolve to backend_id=None (which DOM.getBoxModel would then
-    read as "the node is gone", reporting success for a ref that never was)."""
+    read as "the node is gone", reporting success for a ref that never was).
+
+    Fix round 1, Finding 1: proven deterministically, not by an incidental
+    sandbox network failure. actions.wait_for is spied on and must never be
+    called at all — the only way to know _resolve intercepted first, rather
+    than some downstream call happening to fail for an unrelated reason.
+    """
+    calls = []
+
+    async def spy_wait_for(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(browse.actions, "wait_for", spy_wait_for)
     _prime()
     steps, error = asyncio.run(browse.run_actions(WS, "T1", [
         {"do": "wait_for", "ref_gone": 99},
     ]))
     assert "ref 99 is not in the current view" in error
     assert steps[0]["ok"] is False
+    assert calls == []
 
 
 def test_run_actions_rejects_wait_for_given_both_text_and_ref_gone(monkeypatch):
     """actions.wait_for silently prefers text when given both; _perform must
-    not let that ambiguity through unannounced."""
+    not let that ambiguity through unannounced.
+
+    Fix round 1, Finding 1: same deterministic proof as the test above —
+    spy on actions.wait_for and assert it is never called.
+    """
+    calls = []
+
+    async def spy_wait_for(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(browse.actions, "wait_for", spy_wait_for)
     _prime()
     steps, error = asyncio.run(browse.run_actions(WS, "T1", [
         {"do": "wait_for", "text": "готово", "ref_gone": 2},
     ]))
     assert "not both" in error
     assert steps[0]["ok"] is False
+    assert calls == []
 
 
 def test_run_actions_reports_an_unexpected_failure(monkeypatch):

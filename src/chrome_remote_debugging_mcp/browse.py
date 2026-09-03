@@ -131,7 +131,11 @@ async def _perform(ws_url: str, registry: dict[int, tuple[str, int]],
         return None if moved else f"already {'checked' if target else 'unchecked'}"
     if verb == "scroll":
         scroll_ref = action.get("ref")
-        scroll_backend = registry[scroll_ref][1] if scroll_ref in registry else None
+        # Like wait_for's ref_gone: a ref is optional here (the alternative is
+        # "to"), but a *supplied* ref must resolve through the same guard
+        # every other verb uses — an unknown ref must raise, not be treated
+        # as if no ref were given at all.
+        scroll_backend = _resolve(registry, scroll_ref) if scroll_ref is not None else None
         await actions.scroll(ws_url, scroll_ref, scroll_backend, action.get("to"))
         return None
     if verb == "hover":
