@@ -11,6 +11,10 @@ tool layer converts it to ``{"error": ...}``.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import time
+
 from . import cdp
 
 
@@ -109,9 +113,10 @@ async def press(ws_url: str, key: str) -> None:
             f"unsupported key {key!r}; supported: {', '.join(sorted(_KEYS))}"
         )
     code, text = _KEYS[key]
+    key_value = text if len(text) == 1 else key
     for event_type in ("keyDown", "keyUp"):
         await cdp.send(ws_url, "Input.dispatchKeyEvent", {
-            "type": event_type, "key": key, "code": key,
+            "type": event_type, "key": key_value, "code": key,
             "windowsVirtualKeyCode": code, "nativeVirtualKeyCode": code,
             "text": text if event_type == "keyDown" and len(text) == 1 else "",
         })
@@ -167,3 +172,61 @@ async def hover(ws_url: str, ref: int, backend_id: int) -> None:
     x, y = await resolve_box(ws_url, ref, backend_id)
     await cdp.send(ws_url, "Input.dispatchMouseEvent",
                    {"type": "mouseMoved", "x": x, "y": y})
+
+
+_POLL_INTERVAL = 0.15
+
+
+async def settle(ws_url: str, timeout: float = 2.0) -> None:
+    """Wait until the document reports ``complete``, or give up quietly.
+
+    Deliberately never raises: a page that keeps a request open forever should
+    not fail an otherwise valid batch. Waiting for *content* is the agent's job,
+    through :func:`wait_for`.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            result = await cdp.send(ws_url, "Runtime.evaluate", {
+                "expression": "document.readyState", "returnByValue": True,
+            })
+            if result.get("result", {}).get("value") == "complete":
+                return
+        except Exception:
+            return
+        if time.monotonic() >= deadline:
+            return
+        await asyncio.sleep(_POLL_INTERVAL)
+
+
+async def wait_for(ws_url: str, text: str | None, ref_gone: int | None,
+                   backend_id: int | None, timeout: float = 5.0) -> None:
+    """Poll until ``text`` appears on the page, or the node behind a ref is gone."""
+    if text is None and ref_gone is None:
+        raise ActionError("wait_for needs text or ref_gone")
+
+    deadline = time.monotonic() + timeout
+    expression = None
+    if text is not None:
+        expression = f"document.body.innerText.includes({json.dumps(text, ensure_ascii=False)})"
+
+    while True:
+        if expression is not None:
+            try:
+                result = await cdp.send(ws_url, "Runtime.evaluate", {
+                    "expression": expression, "returnByValue": True,
+                })
+                if result.get("result", {}).get("value"):
+                    return
+            except Exception:
+                pass
+        else:
+            try:
+                await cdp.send(ws_url, "DOM.getBoxModel",
+                               {"backendNodeId": backend_id})
+            except cdp.CDPError:
+                return
+        if time.monotonic() >= deadline:
+            what = f"text {text!r}" if text is not None else f"ref {ref_gone} to disappear"
+            raise ActionError(f"timed out after {timeout}s waiting for {what}")
+        await asyncio.sleep(_POLL_INTERVAL)

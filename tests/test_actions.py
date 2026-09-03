@@ -139,6 +139,18 @@ def test_press_space_sends_its_single_char_text_on_key_down_only(monkeypatch):
     assert up["type"] == "keyUp" and up["text"] == ""
 
 
+def test_press_space_sends_a_single_space_as_the_dom_key_value(monkeypatch):
+    """The DOM ``KeyboardEvent.key`` for the space bar is a single space
+    character, not the literal string "Space" — page code testing
+    ``event.key === ' '`` must see the space. ``code`` stays "Space"."""
+    rec = Recorder()
+    _install(monkeypatch, rec)
+    asyncio.run(actions.press(WS, "Space"))
+    down, up = rec.calls[0][1], rec.calls[1][1]
+    assert down["key"] == " " and up["key"] == " "
+    assert down["code"] == "Space" and up["code"] == "Space"
+
+
 def test_select_sets_the_value_and_fires_events(monkeypatch):
     rec = Recorder(replies={
         "DOM.resolveNode": {"object": {"objectId": "OBJ1"}},
@@ -151,6 +163,7 @@ def test_select_sets_the_value_and_fires_events(monkeypatch):
     assert params["objectId"] == "OBJ1"
     assert params["arguments"] == [{"value": "два"}]
     assert "change" in params["functionDeclaration"]
+    assert "input" in params["functionDeclaration"]
 
 
 def test_select_reports_a_missing_option(monkeypatch):
@@ -248,3 +261,84 @@ def test_hover_moves_the_mouse_without_clicking(monkeypatch):
     asyncio.run(actions.hover(WS, 3, 77))
     assert rec.methods()[-1] == "Input.dispatchMouseEvent"
     assert rec.calls[-1][1]["type"] == "mouseMoved"
+
+
+def test_settle_returns_as_soon_as_the_document_is_complete(monkeypatch):
+    rec = Recorder(replies={"Runtime.evaluate": {"result": {"value": "complete"}}})
+    _install(monkeypatch, rec)
+    asyncio.run(actions.settle(WS))
+    assert rec.methods() == ["Runtime.evaluate"]
+
+
+def test_settle_gives_up_quietly_when_the_document_never_completes(monkeypatch):
+    rec = Recorder(replies={"Runtime.evaluate": {"result": {"value": "loading"}}})
+    _install(monkeypatch, rec)
+    asyncio.run(actions.settle(WS, timeout=0.05))
+    assert rec.methods()                      # it polled
+    # and it did not raise
+
+
+def test_settle_ignores_a_transport_error(monkeypatch):
+    rec = Recorder(errors={"Runtime.evaluate": RuntimeError("socket closed")})
+    _install(monkeypatch, rec)
+    asyncio.run(actions.settle(WS, timeout=0.05))
+
+
+def test_wait_for_text_succeeds_once_the_text_appears(monkeypatch):
+    rec = Recorder(replies={"Runtime.evaluate": {"result": {"value": True}}})
+    _install(monkeypatch, rec)
+    asyncio.run(actions.wait_for(WS, "Результаты", None, None, timeout=1))
+    assert "Runtime.evaluate" in rec.methods()
+    assert "Результаты" in rec.calls[0][1]["expression"]
+
+
+def test_wait_for_text_times_out(monkeypatch):
+    rec = Recorder(replies={"Runtime.evaluate": {"result": {"value": False}}})
+    _install(monkeypatch, rec)
+    with pytest.raises(actions.ActionError) as excinfo:
+        asyncio.run(actions.wait_for(WS, "Нет", None, None, timeout=0.05))
+    assert "timed out" in str(excinfo.value)
+
+
+def test_wait_for_text_ignores_transient_errors_and_still_times_out(monkeypatch):
+    """The text-polling branch must swallow a failed Runtime.evaluate and keep
+    polling rather than abort — only the deadline should end the wait."""
+    rec = Recorder(errors={"Runtime.evaluate": RuntimeError("socket closed")})
+    _install(monkeypatch, rec)
+    with pytest.raises(actions.ActionError) as excinfo:
+        asyncio.run(actions.wait_for(WS, "Нет", None, None, timeout=0.05))
+    assert "timed out" in str(excinfo.value)
+    assert len(rec.calls) >= 2                # it kept retrying, not just once
+
+
+def test_wait_for_ref_gone_succeeds_when_the_box_disappears(monkeypatch):
+    rec = Recorder(errors={"DOM.getBoxModel": cdp.CDPError("Could not compute box model.")})
+    _install(monkeypatch, rec)
+    asyncio.run(actions.wait_for(WS, None, 7, 77, timeout=1))
+    assert "DOM.getBoxModel" in rec.methods()
+
+
+def test_wait_for_ref_gone_propagates_transport_errors(monkeypatch):
+    """A dropped websocket must surface honestly, not be reported as the ref
+    having disappeared — that would manufacture success out of a transport
+    failure."""
+    rec = Recorder(errors={"DOM.getBoxModel": OSError("Connection refused")})
+    _install(monkeypatch, rec)
+    with pytest.raises(OSError, match="Connection refused"):
+        asyncio.run(actions.wait_for(WS, None, 7, 77, timeout=1))
+
+
+def test_wait_for_ref_gone_times_out_while_the_node_lives(monkeypatch):
+    rec = Recorder(replies={"DOM.getBoxModel": BOX})
+    _install(monkeypatch, rec)
+    with pytest.raises(actions.ActionError) as excinfo:
+        asyncio.run(actions.wait_for(WS, None, 7, 77, timeout=0.05))
+    assert "ref 7" in str(excinfo.value)
+
+
+def test_wait_for_requires_a_condition(monkeypatch):
+    rec = Recorder()
+    _install(monkeypatch, rec)
+    with pytest.raises(actions.ActionError) as excinfo:
+        asyncio.run(actions.wait_for(WS, None, None, None, timeout=1))
+    assert "needs text or ref_gone" in str(excinfo.value)
