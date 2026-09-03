@@ -285,3 +285,124 @@ def test_main_stops_tunnel_even_when_run_raises(monkeypatch):
     with pytest.raises(RuntimeError, match="serve crashed"):
         server.main()
     assert events == ["start", "run", "stop"]  # stop ran in finally
+
+
+# --- browse / browse_view / browse_act -------------------------------------
+
+def _stub_browse(monkeypatch, view="url    http://a/\ntitle  T\n\nbutton#1 \"Жми\"",
+                 refs=1, steps=None, error=None, snapshot_exc=None):
+    async def fake_snapshot(ws_url, tab_id):
+        if snapshot_exc is not None:
+            raise snapshot_exc
+        return view, refs
+
+    async def fake_run_actions(ws_url, tab_id, action_list):
+        return steps if steps is not None else [], error
+
+    monkeypatch.setattr(server.browse_engine, "snapshot", fake_snapshot)
+    monkeypatch.setattr(server.browse_engine, "run_actions", fake_run_actions)
+
+
+def test_browse_navigates_then_returns_the_view(monkeypatch):
+    _stub(monkeypatch, targets=[PAGE], send_result={})
+    _stub_browse(monkeypatch)
+
+    async def fake_settle(ws_url, timeout=2.0):
+        return None
+
+    monkeypatch.setattr(server.actions, "settle", fake_settle)
+    out = asyncio.run(_fn(server.browse)("http://a/"))
+    assert out["tab_id"] == "T1"
+    assert out["url"] == "http://a/"
+    assert out["refs"] == 1
+    assert 'button#1 "Жми"' in out["view"]
+
+
+def test_browse_reports_an_unreachable_chrome(monkeypatch):
+    _stub(monkeypatch, targets=None)
+    out = asyncio.run(_fn(server.browse)("http://a/"))
+    assert "cannot reach Chrome" in out["error"]
+
+
+def test_browse_reports_a_navigation_failure(monkeypatch):
+    _stub(monkeypatch, targets=[PAGE], send_exc=RuntimeError("boom"))
+    out = asyncio.run(_fn(server.browse)("http://a/"))
+    assert "navigation failed" in out["error"]
+
+
+def test_browse_reports_a_snapshot_failure(monkeypatch):
+    _stub(monkeypatch, targets=[PAGE], send_result={})
+    _stub_browse(monkeypatch, snapshot_exc=RuntimeError("tree gone"))
+
+    async def fake_settle(ws_url, timeout=2.0):
+        return None
+
+    monkeypatch.setattr(server.actions, "settle", fake_settle)
+    out = asyncio.run(_fn(server.browse)("http://a/"))
+    assert "snapshot failed" in out["error"]
+
+
+def test_browse_view_snapshots_without_navigating(monkeypatch):
+    calls = []
+
+    async def fake_list_targets(url):
+        return [PAGE]
+
+    async def fake_send(ws_url, method, params=None):
+        calls.append(method)
+        return {}
+
+    monkeypatch.setattr(server.cdp, "list_targets", fake_list_targets)
+    monkeypatch.setattr(server.cdp, "send", fake_send)
+    _stub_browse(monkeypatch)
+    out = asyncio.run(_fn(server.browse_view)())
+    assert out["tab_id"] == "T1"
+    assert out["refs"] == 1
+    assert "Page.navigate" not in calls
+
+
+def test_browse_view_reports_no_tabs(monkeypatch):
+    _stub(monkeypatch, targets=[])
+    out = asyncio.run(_fn(server.browse_view)())
+    assert out["error"] == "no page targets open"
+
+
+def test_browse_view_reports_a_snapshot_failure(monkeypatch):
+    _stub(monkeypatch, targets=[PAGE], send_result={})
+    _stub_browse(monkeypatch, snapshot_exc=RuntimeError("tree gone"))
+    out = asyncio.run(_fn(server.browse_view)())
+    assert "snapshot failed" in out["error"]
+
+
+def test_browse_act_returns_steps_and_a_fresh_view(monkeypatch):
+    _stub(monkeypatch, targets=[PAGE], send_result={})
+    _stub_browse(monkeypatch, steps=[{"do": "click", "ok": True}])
+    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}]))
+    assert out["steps"] == [{"do": "click", "ok": True}]
+    assert "error" not in out
+    assert out["refs"] == 1
+
+
+def test_browse_act_surfaces_the_error_and_still_returns_a_view(monkeypatch):
+    _stub(monkeypatch, targets=[PAGE], send_result={})
+    _stub_browse(monkeypatch,
+                 steps=[{"do": "click", "ok": False, "error": "ref 1 is stale"}],
+                 error="ref 1 is stale")
+    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}]))
+    assert out["error"] == "ref 1 is stale"
+    assert out["view"]
+
+
+def test_browse_act_reports_an_unreachable_chrome(monkeypatch):
+    _stub(monkeypatch, targets=None)
+    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}]))
+    assert "cannot reach Chrome" in out["error"]
+
+
+def test_browse_act_reports_a_snapshot_failure_after_acting(monkeypatch):
+    _stub(monkeypatch, targets=[PAGE], send_result={})
+    _stub_browse(monkeypatch, steps=[{"do": "click", "ok": True}],
+                 snapshot_exc=RuntimeError("tree gone"))
+    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}]))
+    assert "snapshot failed" in out["error"]
+    assert out["steps"] == [{"do": "click", "ok": True}]

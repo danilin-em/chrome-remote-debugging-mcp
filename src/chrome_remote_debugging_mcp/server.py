@@ -12,7 +12,8 @@ from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 
-from . import cdp
+from . import actions, cdp
+from . import browse as browse_engine
 from .tunnel import SshLocalForwardTunnel
 
 
@@ -208,6 +209,94 @@ async def cdp_command(
         return {"error": f"CDP command failed: {exc}"}
 
     return {"tab_id": target.get("id"), "method": method, "result": result}
+
+
+@mcp.tool()
+async def browse(url: str, tab_id: str | None = None) -> dict:
+    """Open ``url`` and return a readable view of the page, with numbered refs.
+
+    The view is built from Chrome's accessibility tree — what a screen reader
+    would announce — not from HTML, so it is compact enough to act on. Every
+    interactive element gets a ``#N`` ref usable with ``browse_act``.
+
+    Uses the first page tab when ``tab_id`` is omitted. Returns
+    ``{"tab_id", "url", "view", "refs"}`` or ``{"error": ...}``.
+    """
+    try:
+        target, ws_url = await _resolve_target(tab_id)
+    except _TargetError as exc:
+        return {"error": str(exc)}
+
+    try:
+        await cdp.send(ws_url, "Page.navigate", {"url": url})
+    except Exception as exc:
+        return {"error": f"navigation failed: {exc}"}
+
+    await actions.settle(ws_url, timeout=10.0)
+    try:
+        view, refs = await browse_engine.snapshot(ws_url, target.get("id"))
+    except Exception as exc:
+        return {"error": f"snapshot failed: {exc}"}
+    return {"tab_id": target.get("id"), "url": url, "view": view, "refs": refs}
+
+
+@mcp.tool()
+async def browse_view(tab_id: str | None = None) -> dict:
+    """Re-read the current page and return a fresh view with fresh refs.
+
+    Refs from an earlier view stop being valid once this returns. Returns
+    ``{"tab_id", "view", "refs"}`` or ``{"error": ...}``.
+    """
+    try:
+        target, ws_url = await _resolve_target(tab_id)
+    except _TargetError as exc:
+        return {"error": str(exc)}
+    try:
+        view, refs = await browse_engine.snapshot(ws_url, target.get("id"))
+    except Exception as exc:
+        return {"error": f"snapshot failed: {exc}"}
+    return {"tab_id": target.get("id"), "view": view, "refs": refs}
+
+
+@mcp.tool()
+async def browse_act(actions_list: list[dict], tab_id: str | None = None) -> dict:
+    """Run several actions against the current view, then return one new view.
+
+    Each action is a dict with a ``do`` key:
+
+    - ``{"do": "click", "ref": 3}``
+    - ``{"do": "type", "ref": 2, "text": "коты", "clear": false}``
+    - ``{"do": "press", "key": "Enter"}``
+    - ``{"do": "select", "ref": 5, "value": "два"}``
+    - ``{"do": "check", "ref": 9}`` / ``{"do": "uncheck", "ref": 9}``
+    - ``{"do": "scroll", "ref": 7}`` or ``{"do": "scroll", "to": "bottom"}``
+    - ``{"do": "hover", "ref": 4}``
+    - ``{"do": "wait_for", "text": "Результаты", "timeout": 5}`` or
+      ``{"do": "wait_for", "ref_gone": 3}``
+
+    Refs come from the most recent ``browse`` or ``browse_view`` on this tab and
+    are invalid afterwards. The batch stops at the first failure; a view is
+    returned either way so you can see where the page ended up.
+
+    Returns ``{"tab_id", "steps", "view", "refs"}``, plus ``"error"`` when a
+    step failed, or ``{"error": ...}`` when the tab could not be resolved.
+    """
+    try:
+        target, ws_url = await _resolve_target(tab_id)
+    except _TargetError as exc:
+        return {"error": str(exc)}
+
+    tab = target.get("id")
+    steps, error = await browse_engine.run_actions(ws_url, tab, actions_list)
+    try:
+        view, refs = await browse_engine.snapshot(ws_url, tab)
+    except Exception as exc:
+        return {"tab_id": tab, "steps": steps, "error": f"snapshot failed: {exc}"}
+
+    out = {"tab_id": tab, "steps": steps, "view": view, "refs": refs}
+    if error:
+        out["error"] = error
+    return out
 
 
 def main() -> None:
