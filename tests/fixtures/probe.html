@@ -1,0 +1,21 @@
+<!doctype html><meta charset=utf-8><title>Probe A</title>
+<h1>Заголовок A</h1>
+<p>Видимый абзац.</p>
+<p style="display:none">СКРЫТО display none</p>
+<p style="visibility:hidden">СКРЫТО visibility</p>
+<button id="plain">Обычная кнопка</button>
+<input id="inp" placeholder="Поиск">
+<input id="noname" type="text" name="q2">
+<label><input type="checkbox" id="agree" checked> Согласен</label>
+<select id="sel"><option>один</option><option>два</option></select>
+<button id="off" disabled>Выключена</button>
+<div id="openhost"></div>
+<div id="closedhost"></div>
+<iframe src="/probe_same.html" width=200 height=80></iframe>
+<iframe src="http://127.0.0.1:9444/probe_cross.html" width=200 height=80></iframe>
+<script>
+const o = document.getElementById('openhost').attachShadow({mode:'open'});
+o.innerHTML = '<button>OPEN SHADOW BUTTON</button>';
+const c = document.getElementById('closedhost').attachShadow({mode:'closed'});
+c.innerHTML = '<button>CLOSED SHADOW BUTTON</button>';
+</script>
