@@ -63,16 +63,19 @@ title  Hacker News
 link#20 "Audacity 4.0"
 link#21 "github.com/audacity"
 
-  text "by"
-  link#22 "ClydeN"
-  link#23 "hide"
-  link#24 "10 comments"
+text "by"
+link#22 "ClydeN"
+link#23 "hide"
+link#24 "10 comments"
 ```
 
-(a real, unedited `browse` view against the live front page — indentation
-reflects the page's own table/row/cell nesting, not something the renderer
-imposes. The story, ref numbers and comment count will differ on any given
-run; the front page changes constantly.)
+(a real, unedited `browse` view against the live front page. These two blocks
+— the story's title cell and its byline cell — sit at the *same* depth in
+Hacker News's table markup, so both are flush left here; the blank line alone
+marks the boundary between them. Deeper nesting elsewhere in a page indents
+further, one level per block of ancestry — see `block_path` in `ax.py`. The
+story, ref numbers and comment count will differ on any given run; the front
+page changes constantly.)
 
 A blank line separates blocks and indentation shows nesting. Every interactive
 element Chrome can address carries a `#N` ref (the rare element with no backend
