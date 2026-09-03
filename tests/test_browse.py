@@ -1,6 +1,7 @@
 """Snapshot assembly and batch execution, with the CDP layer stubbed."""
 
 import asyncio
+import re
 
 import pytest
 
@@ -25,6 +26,18 @@ CHILD_NODES = [
     {"nodeId": "1", "role": {"value": "button"}, "name": {"value": "Внутри"},
      "backendDOMNodeId": 301},
 ]
+# An interactive node CDP gave no backendDOMNodeId for — cannot be resolved to
+# a DOM node, so it must never consume a ref number (fix round 1, Finding 1).
+UNRESOLVABLE_NODES = [
+    {"nodeId": "1", "role": {"value": "button"}, "name": {"value": "Мёртвая кнопка"}},
+]
+
+FRAME_TREE_LONG_ID = {
+    "frameTree": {
+        "frame": {"id": "F1", "url": "http://a/"},
+        "childFrames": [{"frame": {"id": "201F341A9E7B4C2D", "url": "http://b/"}}],
+    }
+}
 
 
 class Fake:
@@ -105,6 +118,43 @@ def test_snapshot_walks_child_frames_and_continues_ref_numbering(monkeypatch):
     assert 'button#2 "Внутри"' in view
     assert count == 2
     assert browse.REGISTRY["T1"] == {1: ("F1", 201), 2: ("F2", 301)}
+
+
+def test_snapshot_never_reissues_a_ref_across_frames(monkeypatch):
+    """An interactive node with no backendDOMNodeId must not consume a ref.
+
+    Regression for fix round 1, Finding 1: if F1 contributes an unresolvable
+    interactive node, its ref number must not be handed out at all — not
+    printed without a registry entry, and not silently reused by the next
+    frame. Every printed ``#N`` must resolve in the registry, and no number
+    may appear twice in the assembled view.
+    """
+    fake = Fake(frame_tree=FRAME_TREE_TWO,
+                trees={"F1": UNRESOLVABLE_NODES, "F2": CHILD_NODES})
+    _install(monkeypatch, fake)
+    view, count = asyncio.run(browse.snapshot(WS, "T1"))
+    printed_refs = [int(n) for n in re.findall(r"#(\d+)", view)]
+    assert printed_refs, "expected at least one ref to be printed"
+    assert len(printed_refs) == len(set(printed_refs)), (
+        f"a ref number was reissued in the assembled view:\n{view}"
+    )
+    for ref in printed_refs:
+        assert ref in browse.REGISTRY["T1"], (
+            f"ref #{ref} was printed but has no registry entry:\n{view}"
+        )
+    assert count == len(browse.REGISTRY["T1"])
+
+
+def test_snapshot_truncates_the_frame_marker_to_eight_characters(monkeypatch):
+    fake = Fake(frame_tree=FRAME_TREE_LONG_ID,
+                trees={"F1": MAIN_NODES, "201F341A9E7B4C2D": CHILD_NODES})
+    _install(monkeypatch, fake)
+    view, _ = asyncio.run(browse.snapshot(WS, "T1"))
+    assert "frame 201F341A" in view
+    assert "201F341A9E7B4C2D" not in view
+    # The registry itself must still key on the full frame id (D4/D-spec: the
+    # marker is a display truncation only, never used to address a frame).
+    assert browse.REGISTRY["T1"][2][0] == "201F341A9E7B4C2D"
 
 
 def test_snapshot_omits_a_frame_marker_for_an_empty_child_frame(monkeypatch):

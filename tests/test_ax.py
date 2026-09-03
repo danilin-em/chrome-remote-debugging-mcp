@@ -187,6 +187,30 @@ def test_render_numbers_refs_from_ref_start_and_maps_backend_ids():
     assert refs == {6: 101, 7: 102}
 
 
+def test_render_skips_a_ref_for_an_interactive_node_with_no_backend_id():
+    """A node CDP gave no backendDOMNodeId for must never consume a ref number
+    (fix round 1, Finding 1): printing ``#N`` with no matching entry in the
+    refs map desyncs any caller that sizes its next ``ref_start`` from
+    ``len(refs)`` — as ``browse.snapshot`` does across frames — letting a
+    later frame reissue that same number for an unrelated element.
+    """
+    nodes = [
+        {"nodeId": "1", "role": {"value": "button"}, "name": {"value": "Мёртвая"}},
+        {"nodeId": "2", "role": {"value": "button"}, "name": {"value": "B"},
+         "backendDOMNodeId": 102},
+    ]
+    lines, refs = ax.render_nodes(nodes)
+    assert lines == ['button "Мёртвая"', 'button#1 "B"']
+    assert refs == {1: 102}
+
+
+def test_render_drops_an_unnamed_interactive_node_with_no_backend_id():
+    nodes = [{"nodeId": "1", "role": {"value": "button"}, "name": {"value": ""}}]
+    lines, refs = ax.render_nodes(nodes)
+    assert lines == []
+    assert refs == {}
+
+
 def test_render_updates_a_supplied_ref_map_in_place():
     nodes = [{"nodeId": "1", "role": {"value": "button"}, "name": {"value": "A"},
               "backendDOMNodeId": 101}]

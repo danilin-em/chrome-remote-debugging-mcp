@@ -188,8 +188,19 @@ def _content_line(node: dict, by_id: dict[str, dict], attrs: dict[int, dict],
         return f'text "{name}"', ref, None
 
     if role in INTERACTIVE_ROLES:
+        backend_id = node.get("backendDOMNodeId")
+        if backend_id is None:
+            # Nothing to resolve a ref back to (CDP documents this field as
+            # optional). Must never consume a ref number — a caller stitching
+            # several frames together sizes its next ref_start from how many
+            # refs actually landed in the map, so a ref handed out here with
+            # no map entry desyncs that count and a later frame reissues it.
+            # Fall back to a plain named line, like a landmark; drop entirely
+            # when there is no name either.
+            name = node_name(node)
+            return (f'{role} "{name}"' if name else None), ref, None
         ref += 1
-        return format_interactive(node, ref, attrs), ref, node.get("backendDOMNodeId")
+        return format_interactive(node, ref, attrs), ref, backend_id
 
     structure = format_structure(node)
     if structure is not None:

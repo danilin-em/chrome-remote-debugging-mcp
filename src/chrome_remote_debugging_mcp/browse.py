@@ -75,12 +75,11 @@ async def snapshot(ws_url: str, tab_id: str) -> tuple[str, int]:
         nodes = tree.get("nodes", [])
         ax.strip_sources(nodes)
         attrs = await _attributes_for(ws_url, ax.unnamed_backend_ids(nodes))
-        frame_refs: dict[int, int] = {}
-        frame_lines, frame_refs = ax.render_nodes(nodes, ref_count, frame_refs, attrs)
+        frame_lines, frame_refs = ax.render_nodes(nodes, ref_count, attrs=attrs)
         if not frame_lines:
             continue
         if index > 0:
-            lines.append(f"frame {frame_id}")
+            lines.append(f"frame {frame_id[:8]}")
         lines.extend(frame_lines)
         for ref, backend_id in frame_refs.items():
             registry[ref] = (frame_id, backend_id)
