@@ -71,7 +71,7 @@ def node_value(node: dict) -> str:
 
 def node_properties(node: dict) -> dict:
     """Flatten the ``properties`` list into ``{name: value}``."""
-    return {p["name"]: p["value"].get("value") for p in node.get("properties", [])}
+    return {p["name"]: p["value"].get("value") for p in (node.get("properties") or [])}
 
 
 def is_punctuation(text: str) -> bool:

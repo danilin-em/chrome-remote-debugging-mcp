@@ -15,12 +15,16 @@ def test_accessors_read_the_nested_blobs(probe_nodes):
 
 def test_accessors_tolerate_missing_and_null_blobs():
     assert ax.node_role({}) == ""
+    assert ax.node_role({"role": None}) == ""
+    assert ax.node_role({"role": {"value": None}}) == ""
     assert ax.node_name({}) == ""
     assert ax.node_name({"name": None}) == ""
+    assert ax.node_name({"name": {"value": None}}) == ""
     assert ax.node_value({}) == ""
     assert ax.node_value({"value": None}) == ""
     assert ax.node_value({"value": {"value": None}}) == ""
     assert ax.node_properties({}) == {}
+    assert ax.node_properties({"properties": None}) == {}
 
 
 def test_node_properties_flattens_the_property_list():
