@@ -87,3 +87,99 @@ async def snapshot(ws_url: str, tab_id: str) -> tuple[str, int]:
 
     REGISTRY[tab_id] = registry
     return "\n".join(lines), len(registry)
+
+
+# Verbs that address an element and therefore require a resolvable ref.
+_NEEDS_REF = frozenset({"click", "type", "select", "check", "uncheck", "hover"})
+
+
+def _resolve(registry: dict[int, tuple[str, int]], ref) -> int:
+    """Backend id behind a ref, or raise with an agent-readable reason."""
+    if ref is None:
+        raise actions.ActionError("this action needs a ref")
+    if ref not in registry:
+        raise actions.ActionError(
+            f"ref {ref} is not in the current view; take a new snapshot"
+        )
+    return registry[ref][1]
+
+
+async def _perform(ws_url: str, registry: dict[int, tuple[str, int]],
+                   action: dict) -> str | None:
+    """Run one action. Returns an optional detail string for the step result."""
+    verb = action.get("do")
+    ref = action.get("ref")
+    backend_id = _resolve(registry, ref) if verb in _NEEDS_REF else None
+
+    if verb == "click":
+        await actions.click(ws_url, ref, backend_id)
+        return None
+    if verb == "type":
+        await actions.type_text(ws_url, ref, backend_id,
+                                action.get("text", ""),
+                                bool(action.get("clear", False)))
+        return None
+    if verb == "press":
+        await actions.press(ws_url, action.get("key", ""))
+        return None
+    if verb == "select":
+        await actions.select(ws_url, ref, backend_id, action.get("value", ""))
+        return None
+    if verb in ("check", "uncheck"):
+        target = verb == "check"
+        moved = await actions.set_checked(ws_url, ref, backend_id, target)
+        return None if moved else f"already {'checked' if target else 'unchecked'}"
+    if verb == "scroll":
+        scroll_ref = action.get("ref")
+        scroll_backend = registry[scroll_ref][1] if scroll_ref in registry else None
+        await actions.scroll(ws_url, scroll_ref, scroll_backend, action.get("to"))
+        return None
+    if verb == "hover":
+        await actions.hover(ws_url, ref, backend_id)
+        return None
+    if verb == "wait_for":
+        text = action.get("text")
+        gone = action.get("ref_gone")
+        # actions.wait_for silently prefers text when given both; refuse the
+        # ambiguity here instead of letting one condition win unannounced.
+        if text is not None and gone is not None:
+            raise actions.ActionError(
+                "wait_for takes either text or ref_gone, not both"
+            )
+        gone_backend = _resolve(registry, gone) if gone is not None else None
+        await actions.wait_for(ws_url, text, gone, gone_backend,
+                               float(action.get("timeout", 5.0)))
+        return None
+    raise actions.ActionError(f'unknown action "{verb}"')
+
+
+async def run_actions(ws_url: str, tab_id: str,
+                      action_list: list[dict]) -> tuple[list[dict], str | None]:
+    """Run a batch against the tab's current view.
+
+    The first failure stops the batch: continuing would mean acting on a page
+    whose state is no longer understood. Returns the per-step results and the
+    error that stopped it, or ``None``.
+    """
+    registry = REGISTRY.get(tab_id)
+    if registry is None:
+        return [], "no view for this tab; call browse or browse_view first"
+
+    steps: list[dict] = []
+    for action in action_list:
+        verb = action.get("do")
+        try:
+            detail = await _perform(ws_url, registry, action)
+        except actions.ActionError as exc:
+            steps.append({"do": verb, "ok": False, "error": str(exc)})
+            return steps, str(exc)
+        except Exception as exc:  # unexpected CDP or transport failure
+            message = f"{verb} failed: {exc}"
+            steps.append({"do": verb, "ok": False, "error": message})
+            return steps, message
+        step: dict = {"do": verb, "ok": True}
+        if detail:
+            step["detail"] = detail
+        steps.append(step)
+        await actions.settle(ws_url)
+    return steps, None

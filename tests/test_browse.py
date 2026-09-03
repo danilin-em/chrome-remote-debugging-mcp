@@ -193,3 +193,221 @@ def test_snapshot_falls_back_when_the_metadata_probe_fails(monkeypatch):
 
 def test_registry_for_returns_an_empty_map_for_an_unknown_tab():
     assert browse.registry_for("nope") == {}
+
+
+def _prime(tab_id="T1", refs=None):
+    browse.REGISTRY[tab_id] = refs or {1: ("F1", 201), 2: ("F1", 202)}
+
+
+def test_run_actions_executes_every_step_in_order(monkeypatch):
+    performed = []
+
+    async def fake_click(ws_url, ref, backend_id):
+        performed.append(("click", ref, backend_id))
+
+    async def fake_type(ws_url, ref, backend_id, text, clear=False):
+        performed.append(("type", ref, text, clear))
+
+    async def fake_settle(ws_url, timeout=2.0):
+        performed.append(("settle",))
+
+    monkeypatch.setattr(browse.actions, "click", fake_click)
+    monkeypatch.setattr(browse.actions, "type_text", fake_type)
+    monkeypatch.setattr(browse.actions, "settle", fake_settle)
+    _prime()
+
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [
+        {"do": "type", "ref": 2, "text": "коты"},
+        {"do": "click", "ref": 1},
+    ]))
+    assert error is None
+    assert [s["ok"] for s in steps] == [True, True]
+    assert ("type", 2, "коты", False) in performed
+    assert ("click", 1, 201) in performed
+    assert performed.count(("settle",)) == 2
+
+
+def test_run_actions_stops_at_the_first_failure(monkeypatch):
+    calls = []
+
+    async def fake_click(ws_url, ref, backend_id):
+        calls.append(ref)
+        raise browse.actions.ActionError("ref 1 is stale; take a new snapshot")
+
+    monkeypatch.setattr(browse.actions, "click", fake_click)
+    monkeypatch.setattr(browse.actions, "settle",
+                        lambda *a, **k: asyncio.sleep(0))
+    _prime()
+
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [
+        {"do": "click", "ref": 1},
+        {"do": "click", "ref": 2},
+    ]))
+    assert "stale" in error
+    assert len(steps) == 1 and steps[0]["ok"] is False
+    assert calls == [1]
+
+
+def test_run_actions_rejects_an_unknown_ref(monkeypatch):
+    _prime()
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [{"do": "click", "ref": 99}]))
+    assert "ref 99 is not in the current view" in error
+    assert steps[0]["ok"] is False
+
+
+def test_run_actions_rejects_an_unknown_action(monkeypatch):
+    _prime()
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [{"do": "teleport"}]))
+    assert 'unknown action "teleport"' in error
+
+
+def test_run_actions_requires_a_ref_where_one_is_needed(monkeypatch):
+    _prime()
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [{"do": "click"}]))
+    assert "needs a ref" in error
+
+
+def test_run_actions_reports_a_missing_registry():
+    steps, error = asyncio.run(browse.run_actions(WS, "T9", [{"do": "click", "ref": 1}]))
+    assert "no view for this tab" in error
+    assert steps == []
+
+
+def test_run_actions_dispatches_every_supported_verb(monkeypatch):
+    seen = []
+
+    async def record(name, *args, **kwargs):
+        seen.append(name)
+
+    monkeypatch.setattr(browse.actions, "click",
+                        lambda *a, **k: record("click"))
+    monkeypatch.setattr(browse.actions, "type_text",
+                        lambda *a, **k: record("type"))
+    monkeypatch.setattr(browse.actions, "press",
+                        lambda *a, **k: record("press"))
+    monkeypatch.setattr(browse.actions, "select",
+                        lambda *a, **k: record("select"))
+    monkeypatch.setattr(browse.actions, "set_checked",
+                        lambda *a, **k: record("checked"))
+    monkeypatch.setattr(browse.actions, "scroll",
+                        lambda *a, **k: record("scroll"))
+    monkeypatch.setattr(browse.actions, "hover",
+                        lambda *a, **k: record("hover"))
+    monkeypatch.setattr(browse.actions, "wait_for",
+                        lambda *a, **k: record("wait_for"))
+    monkeypatch.setattr(browse.actions, "settle",
+                        lambda *a, **k: asyncio.sleep(0))
+    _prime()
+
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [
+        {"do": "click", "ref": 1},
+        {"do": "type", "ref": 1, "text": "x"},
+        {"do": "press", "key": "Enter"},
+        {"do": "select", "ref": 1, "value": "два"},
+        {"do": "check", "ref": 1},
+        {"do": "uncheck", "ref": 1},
+        {"do": "scroll", "to": "bottom"},
+        {"do": "hover", "ref": 1},
+        {"do": "wait_for", "text": "готово"},
+    ]))
+    assert error is None
+    assert seen == ["click", "type", "press", "select", "checked", "checked",
+                    "scroll", "hover", "wait_for"]
+    assert len(steps) == 9
+
+
+def test_run_actions_reports_whether_a_checkbox_moved(monkeypatch):
+    async def fake_set_checked(ws_url, ref, backend_id, target):
+        return False
+
+    monkeypatch.setattr(browse.actions, "set_checked", fake_set_checked)
+    monkeypatch.setattr(browse.actions, "settle", lambda *a, **k: asyncio.sleep(0))
+    _prime()
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [{"do": "check", "ref": 1}]))
+    assert error is None
+    assert steps[0]["detail"] == "already checked"
+
+
+def test_run_actions_reports_a_successful_checkbox_click(monkeypatch):
+    """Complements the already-in-target-state test above: when the checkbox
+    actually moved, ``set_checked`` returns True and no detail is reported."""
+    async def fake_set_checked(ws_url, ref, backend_id, target):
+        return True
+
+    monkeypatch.setattr(browse.actions, "set_checked", fake_set_checked)
+    monkeypatch.setattr(browse.actions, "settle", lambda *a, **k: asyncio.sleep(0))
+    _prime()
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [{"do": "check", "ref": 1}]))
+    assert error is None
+    assert "detail" not in steps[0]
+
+
+def test_run_actions_resolves_a_scroll_targeted_by_ref(monkeypatch):
+    seen = {}
+
+    async def fake_scroll(ws_url, ref, backend_id, to):
+        seen.update(ref=ref, backend_id=backend_id, to=to)
+
+    monkeypatch.setattr(browse.actions, "scroll", fake_scroll)
+    monkeypatch.setattr(browse.actions, "settle", lambda *a, **k: asyncio.sleep(0))
+    _prime()
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [
+        {"do": "scroll", "ref": 1},
+    ]))
+    assert error is None
+    assert seen == {"ref": 1, "backend_id": 201, "to": None}
+
+
+def test_run_actions_passes_wait_for_a_resolved_ref(monkeypatch):
+    seen = {}
+
+    async def fake_wait_for(ws_url, text, ref_gone, backend_id, timeout=5.0):
+        seen.update(text=text, ref_gone=ref_gone, backend_id=backend_id,
+                    timeout=timeout)
+
+    monkeypatch.setattr(browse.actions, "wait_for", fake_wait_for)
+    monkeypatch.setattr(browse.actions, "settle", lambda *a, **k: asyncio.sleep(0))
+    _prime()
+    asyncio.run(browse.run_actions(WS, "T1", [
+        {"do": "wait_for", "ref_gone": 2, "timeout": 3},
+    ]))
+    assert seen == {"text": None, "ref_gone": 2, "backend_id": 202, "timeout": 3}
+
+
+def test_run_actions_rejects_wait_for_with_an_unknown_ref_gone(monkeypatch):
+    """CONTROLLER RULING 1: an unknown ref_gone must raise through _resolve,
+    not silently resolve to backend_id=None (which DOM.getBoxModel would then
+    read as "the node is gone", reporting success for a ref that never was)."""
+    _prime()
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [
+        {"do": "wait_for", "ref_gone": 99},
+    ]))
+    assert "ref 99 is not in the current view" in error
+    assert steps[0]["ok"] is False
+
+
+def test_run_actions_rejects_wait_for_given_both_text_and_ref_gone(monkeypatch):
+    """actions.wait_for silently prefers text when given both; _perform must
+    not let that ambiguity through unannounced."""
+    _prime()
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [
+        {"do": "wait_for", "text": "готово", "ref_gone": 2},
+    ]))
+    assert "not both" in error
+    assert steps[0]["ok"] is False
+
+
+def test_run_actions_reports_an_unexpected_failure(monkeypatch):
+    """CONTROLLER RULING 2: a non-ActionError exception (unexpected CDP or
+    transport failure) must still be recorded as a failed step, not propagate
+    and crash the batch."""
+    async def fake_click(ws_url, ref, backend_id):
+        raise RuntimeError("socket closed")
+
+    monkeypatch.setattr(browse.actions, "click", fake_click)
+    _prime()
+    steps, error = asyncio.run(browse.run_actions(WS, "T1", [
+        {"do": "click", "ref": 1},
+    ]))
+    assert error == "click failed: socket closed"
+    assert steps == [{"do": "click", "ok": False, "error": "click failed: socket closed"}]
