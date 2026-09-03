@@ -9,11 +9,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import pathlib
+import re
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from chrome_remote_debugging_mcp import actions, browse, cdp  # noqa: E402
+
+# Matches the start of any interactive line ax.py can render — "role#ref ...",
+# e.g. "link#3 ..." or "button#5 ...". Keyed off the shape (a role name, "#",
+# digits) rather than a hardcoded role list, so it tracks ax.INTERACTIVE_ROLES
+# without duplicating it.
+_REF_LINE = re.compile(r"^\S+#\d+\s")
 
 
 async def main() -> None:
@@ -24,7 +31,9 @@ async def main() -> None:
     args = parser.parse_args()
 
     targets = await cdp.list_targets(args.cdp_url)
-    page = next(t for t in targets if t.get("type") == "page")
+    page = next((t for t in targets if t.get("type") == "page"), None)
+    if page is None:
+        sys.exit(f"no page target found at {args.cdp_url}")
     ws_url = page["webSocketDebuggerUrl"]
     tab_id = page["id"]
 
@@ -38,12 +47,11 @@ async def main() -> None:
 
     wanted = next(
         (line for line in view.splitlines()
-         if line.strip().startswith("link#") and f'"{args.click_text}"' in line),
+         if _REF_LINE.match(line.strip()) and f'"{args.click_text}"' in line),
         None,
     )
     if wanted is None:
-        print(f"\nno link named {args.click_text!r} in the view")
-        return
+        sys.exit(f"no interactive element matching {args.click_text!r} in the view")
     ref = int(wanted.strip().split("#")[1].split()[0])
     print(f"\nclicking {wanted.strip()}")
 
