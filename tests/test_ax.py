@@ -340,6 +340,18 @@ def test_render_handles_an_empty_tree():
     assert ax.render_nodes([]) == ([], {})
 
 
+def test_render_drops_option_nodes_since_they_cannot_be_clicked():
+    """M8: "option" was removed from INTERACTIVE_ROLES. A native <option>
+    cannot be clicked — that is why `select` exists as D5's documented
+    exception — so giving it a ref would be a ref no action could ever
+    resolve, the same defect class already avoided for a node with no
+    backendDOMNodeId."""
+    nodes = [{"nodeId": "1", "role": {"value": "option"}, "name": {"value": "один"}}]
+    lines, refs = ax.render_nodes(nodes)
+    assert lines == []
+    assert refs == {}
+
+
 def test_render_survives_a_broken_parent_link():
     nodes = [{"nodeId": "1", "role": {"value": "StaticText"},
               "name": {"value": "orphan"}, "parentId": "missing"}]

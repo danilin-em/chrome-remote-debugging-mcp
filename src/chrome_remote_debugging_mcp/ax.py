@@ -18,11 +18,15 @@ WRAPPER_ROLES = frozenset({
     "GenericContainer", "LayoutTable", "LayoutTableRow", "LayoutTableCell",
 })
 
-# R6 — roles an agent can act on; these receive a ref.
+# R6 — roles an agent can act on; these receive a ref. "option" is
+# deliberately excluded (M8): a native <option> cannot be clicked — that is
+# why `select` exists as D5's documented exception — so a ref on one is a ref
+# no action could ever resolve, the same defect class as a node with no
+# backendDOMNodeId (see the comment in _content_line below).
 INTERACTIVE_ROLES = frozenset({
     "button", "link", "textbox", "checkbox", "radio", "combobox", "searchbox",
     "menuitem", "menuitemcheckbox", "menuitemradio", "tab", "switch", "slider",
-    "spinbutton", "listbox", "option",
+    "spinbutton", "listbox",
 })
 
 # R10 — landmarks worth printing for orientation; no ref.
