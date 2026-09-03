@@ -28,7 +28,7 @@ async def resolve_box(ws_url: str, ref: int, backend_id: int) -> tuple[float, fl
         await cdp.send(ws_url, "DOM.scrollIntoViewIfNeeded",
                        {"backendNodeId": backend_id})
         box = await cdp.send(ws_url, "DOM.getBoxModel", {"backendNodeId": backend_id})
-    except Exception as exc:
+    except cdp.CDPError as exc:
         raise ActionError(f"ref {ref} is stale; take a new snapshot ({exc})")
     quad = box["model"]["content"]
     return (quad[0] + quad[4]) / 2, (quad[1] + quad[5]) / 2

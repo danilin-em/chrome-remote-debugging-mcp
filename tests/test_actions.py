@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 import chrome_remote_debugging_mcp.actions as actions
+from chrome_remote_debugging_mcp import cdp
 
 WS = "ws://fake"
 BOX = {"model": {"content": [10, 20, 30, 20, 30, 40, 10, 40]}}
@@ -39,10 +40,11 @@ def test_resolve_box_returns_the_content_box_centre(monkeypatch):
     assert (x, y) == (20.0, 30.0)
     assert rec.methods() == ["DOM.scrollIntoViewIfNeeded", "DOM.getBoxModel"]
     assert rec.calls[0][1] == {"backendNodeId": 77}
+    assert rec.calls[1][1] == {"backendNodeId": 77}
 
 
 def test_resolve_box_reports_a_stale_ref(monkeypatch):
-    rec = Recorder(errors={"DOM.getBoxModel": RuntimeError("Could not compute box model.")})
+    rec = Recorder(errors={"DOM.getBoxModel": cdp.CDPError("Could not compute box model.")})
     _install(monkeypatch, rec)
     with pytest.raises(actions.ActionError) as excinfo:
         asyncio.run(actions.resolve_box(WS, 5, 77))
@@ -50,7 +52,7 @@ def test_resolve_box_reports_a_stale_ref(monkeypatch):
 
 
 def test_resolve_box_reports_a_failed_scroll(monkeypatch):
-    rec = Recorder(errors={"DOM.scrollIntoViewIfNeeded": RuntimeError("Node is detached")})
+    rec = Recorder(errors={"DOM.scrollIntoViewIfNeeded": cdp.CDPError("Node is detached")})
     _install(monkeypatch, rec)
     with pytest.raises(actions.ActionError) as excinfo:
         asyncio.run(actions.resolve_box(WS, 5, 77))
@@ -70,3 +72,13 @@ def test_click_dispatches_a_press_and_a_release(monkeypatch):
     assert release["type"] == "mouseReleased"
     assert press["x"] == 20.0 and press["y"] == 30.0
     assert press["button"] == "left" and press["clickCount"] == 1
+    assert release["x"] == 20.0 and release["y"] == 30.0
+    assert release["button"] == "left" and release["clickCount"] == 1
+
+
+def test_resolve_box_propagates_transport_errors(monkeypatch):
+    """Transport errors (not CDP errors) must propagate, not convert to stale-ref."""
+    rec = Recorder(errors={"DOM.getBoxModel": OSError("Connection refused")})
+    _install(monkeypatch, rec)
+    with pytest.raises(OSError, match="Connection refused"):
+        asyncio.run(actions.resolve_box(WS, 5, 77))
