@@ -149,3 +149,91 @@ def format_structure(node: dict) -> str | None:
     if role in STRUCTURE_ROLES and name:
         return f'{role} "{name}"'
     return None
+
+
+def block_path(node: dict, by_id: dict[str, dict]) -> tuple[str, ...]:
+    """Ids of the node's block ancestors, outermost first (R12).
+
+    Wrapper roles (R2) are skipped, so a layout table nesting a semantic table
+    contributes only one level of depth rather than two.
+    """
+    path = []
+    current = by_id.get(node.get("parentId"))
+    while current is not None:
+        if node_role(current) in BLOCK_ROLES and not current.get("ignored"):
+            path.append(current["nodeId"])
+        current = by_id.get(current.get("parentId"))
+    return tuple(reversed(path))
+
+
+def _content_line(node: dict, by_id: dict[str, dict], attrs: dict[int, dict],
+                  ref: int) -> tuple[str | None, int, int | None]:
+    """Render one node. Returns ``(line, next_ref, backend_id_for_ref)``.
+
+    ``line`` is ``None`` when the node produces nothing (R1-R5).
+    """
+    if node.get("ignored"):
+        return None, ref, None
+    role = node_role(node)
+    if role in WRAPPER_ROLES or role == "RootWebArea":
+        return None, ref, None
+
+    if role == "StaticText":
+        name = node_name(node)
+        if not name or is_punctuation(name):
+            return None, ref, None
+        parent = by_id.get(node.get("parentId"))
+        if parent is not None and node_name(parent) == name:
+            return None, ref, None
+        return f'text "{name}"', ref, None
+
+    if role in INTERACTIVE_ROLES:
+        ref += 1
+        return format_interactive(node, ref, attrs), ref, node.get("backendDOMNodeId")
+
+    structure = format_structure(node)
+    if structure is not None:
+        return structure, ref, None
+    return None, ref, None
+
+
+def render_nodes(
+    nodes: list[dict],
+    ref_start: int = 0,
+    refs: dict[int, int] | None = None,
+    attrs: dict[int, dict] | None = None,
+) -> tuple[list[str], dict[int, int]]:
+    """Render one frame's accessibility nodes as view lines.
+
+    Returns the lines and ``{ref: backend_node_id}``. Refs continue from
+    ``ref_start``; when ``refs`` is given it is updated in place and returned,
+    so a caller can number a whole page across several frames.
+    """
+    refs = refs if refs is not None else {}
+    attrs = attrs or {}
+    by_id = {n["nodeId"]: n for n in nodes}
+
+    items: list[tuple[tuple[str, ...], str]] = []
+    ref = ref_start
+    for node in nodes:
+        line, ref, backend_id = _content_line(node, by_id, attrs, ref)
+        if line is None:
+            continue
+        if backend_id is not None:
+            refs[ref] = backend_id
+        items.append((block_path(node, by_id), line))
+
+    if not items:
+        return [], refs
+
+    # Normalise indentation so the shallowest content sits at column 0, then
+    # separate sibling blocks with a blank line (D7).
+    base = min(len(path) for path, _ in items)
+    lines: list[str] = []
+    previous: tuple[str, ...] | None = None
+    for path, line in items:
+        if previous is not None and path != previous:
+            lines.append("")
+        previous = path
+        lines.append("  " * max(0, len(path) - base) + line)
+    return lines, refs

@@ -142,3 +142,159 @@ def test_format_structure_prints_named_landmarks_only():
     assert ax.format_structure(
         {"role": {"value": "paragraph"}, "name": {"value": "x"}}
     ) is None
+
+
+def _render(nodes, **kw):
+    lines, refs = ax.render_nodes(nodes, **kw)
+    return lines, refs
+
+
+def test_render_drops_ignored_wrappers_and_root(probe_nodes):
+    lines, _ = _render(probe_nodes)
+    joined = "\n".join(lines)
+    assert "СКРЫТО" not in joined
+    assert "RootWebArea" not in joined
+    assert "generic" not in joined
+    assert "InlineTextBox" not in joined
+
+
+def test_render_keeps_visible_content_of_the_probe_page(probe_nodes):
+    lines, refs = _render(probe_nodes)
+    joined = "\n".join(lines)
+    assert 'heading "Заголовок A"' in joined
+    assert 'text "Видимый абзац."' in joined
+    assert any(l.startswith("button#") and "Обычная кнопка" in l for l in lines)
+    assert any("CLOSED SHADOW BUTTON" in l for l in lines)
+    assert refs, "interactive nodes must produce refs"
+
+
+def test_render_numbers_refs_from_ref_start_and_maps_backend_ids():
+    nodes = [
+        {"nodeId": "1", "role": {"value": "button"}, "name": {"value": "A"},
+         "backendDOMNodeId": 101},
+        {"nodeId": "2", "role": {"value": "button"}, "name": {"value": "B"},
+         "backendDOMNodeId": 102},
+    ]
+    lines, refs = ax.render_nodes(nodes, ref_start=5)
+    assert lines == ['button#6 "A"', 'button#7 "B"']
+    assert refs == {6: 101, 7: 102}
+
+
+def test_render_updates_a_supplied_ref_map_in_place():
+    nodes = [{"nodeId": "1", "role": {"value": "button"}, "name": {"value": "A"},
+              "backendDOMNodeId": 101}]
+    existing = {1: 99}
+    lines, refs = ax.render_nodes(nodes, ref_start=1, refs=existing)
+    assert refs is existing
+    assert existing == {1: 99, 2: 101}
+
+
+def test_render_drops_punctuation_text_and_parent_duplicates():
+    nodes = [
+        {"nodeId": "1", "role": {"value": "link"}, "name": {"value": "Home"},
+         "backendDOMNodeId": 1, "childIds": ["2"]},
+        {"nodeId": "2", "role": {"value": "StaticText"}, "name": {"value": "Home"},
+         "parentId": "1"},
+        {"nodeId": "3", "role": {"value": "StaticText"}, "name": {"value": "|"}},
+        {"nodeId": "4", "role": {"value": "StaticText"}, "name": {"value": ""}},
+        {"nodeId": "5", "role": {"value": "StaticText"}, "name": {"value": "by"}},
+    ]
+    lines, _ = ax.render_nodes(nodes)
+    assert lines == ['link#1 "Home"', 'text "by"']
+
+
+def test_render_keeps_text_that_differs_from_its_parent_name():
+    nodes = [
+        {"nodeId": "1", "role": {"value": "paragraph"}, "name": {"value": "Intro"},
+         "childIds": ["2"]},
+        {"nodeId": "2", "role": {"value": "StaticText"}, "name": {"value": "Body"},
+         "parentId": "1"},
+    ]
+    lines, _ = ax.render_nodes(nodes)
+    assert lines == ['text "Body"']
+
+
+def test_render_separates_blocks_with_a_blank_line_and_indents_nesting():
+    nodes = [
+        {"nodeId": "r1", "role": {"value": "row"}, "name": {"value": ""}},
+        {"nodeId": "t1", "role": {"value": "StaticText"}, "name": {"value": "one"},
+         "parentId": "r1"},
+        {"nodeId": "r2", "role": {"value": "row"}, "name": {"value": ""}},
+        {"nodeId": "t2", "role": {"value": "StaticText"}, "name": {"value": "two"},
+         "parentId": "r2"},
+        {"nodeId": "c1", "role": {"value": "cell"}, "name": {"value": ""},
+         "parentId": "r2"},
+        {"nodeId": "t3", "role": {"value": "StaticText"}, "name": {"value": "deep"},
+         "parentId": "c1"},
+    ]
+    lines, _ = ax.render_nodes(nodes)
+    assert lines == ['text "one"', "", 'text "two"', "", '  text "deep"']
+
+
+def test_render_drops_blocks_with_no_renderable_content():
+    nodes = [
+        {"nodeId": "r1", "role": {"value": "row"}, "name": {"value": ""}},
+        {"nodeId": "r2", "role": {"value": "row"}, "name": {"value": ""}},
+        {"nodeId": "t1", "role": {"value": "StaticText"}, "name": {"value": "only"},
+         "parentId": "r2"},
+    ]
+    lines, _ = ax.render_nodes(nodes)
+    assert lines == ['text "only"']
+
+
+def test_render_prints_a_heading_line_and_opens_a_block():
+    nodes = [
+        {"nodeId": "h", "role": {"value": "heading"}, "name": {"value": "Title"}},
+        {"nodeId": "t", "role": {"value": "StaticText"}, "name": {"value": "Body"},
+         "parentId": "h"},
+    ]
+    lines, _ = ax.render_nodes(nodes)
+    assert lines == ['heading "Title"', "", '  text "Body"']
+
+
+def test_render_ignores_wrapper_ancestors_when_computing_indentation():
+    nodes = [
+        {"nodeId": "lt", "role": {"value": "LayoutTable"}, "name": {"value": ""}},
+        {"nodeId": "ltr", "role": {"value": "LayoutTableRow"}, "name": {"value": ""},
+         "parentId": "lt"},
+        {"nodeId": "t", "role": {"value": "StaticText"}, "name": {"value": "flat"},
+         "parentId": "ltr"},
+    ]
+    lines, _ = ax.render_nodes(nodes)
+    assert lines == ['text "flat"']
+
+
+def test_render_normalises_indentation_to_the_shallowest_content():
+    nodes = [
+        {"nodeId": "m", "role": {"value": "main"}, "name": {"value": ""}},
+        {"nodeId": "p", "role": {"value": "paragraph"}, "name": {"value": ""},
+         "parentId": "m"},
+        {"nodeId": "t", "role": {"value": "StaticText"}, "name": {"value": "only"},
+         "parentId": "p"},
+    ]
+    lines, _ = ax.render_nodes(nodes)
+    assert lines == ['text "only"']
+
+
+def test_render_handles_an_empty_tree():
+    assert ax.render_nodes([]) == ([], {})
+
+
+def test_render_survives_a_broken_parent_link():
+    nodes = [{"nodeId": "1", "role": {"value": "StaticText"},
+              "name": {"value": "orphan"}, "parentId": "missing"}]
+    lines, _ = ax.render_nodes(nodes)
+    assert lines == ['text "orphan"']
+
+
+def test_render_real_pages_produce_refs_and_no_unresolved_labels(ax_fixture):
+    for name in ("hn", "youtube", "wikipedia"):
+        frames = ax_fixture(name)
+        lines, refs = ax.render_nodes(frames[0]["nodes"])
+        assert refs, f"{name} produced no refs"
+        for ref in refs:
+            assert any(f"#{ref} " in line for line in lines), (
+                f"{name} ref #{ref} is not reachable in the rendered text"
+            )
+        assert len(refs) >= 50, f"{name} produced only {len(refs)} refs, expected >= 50"
+        assert lines, f"{name} produced no lines"
