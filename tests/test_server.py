@@ -20,11 +20,16 @@ def _fn(tool):
     return getattr(tool, "fn", tool)
 
 
-def _stub(monkeypatch, targets=None, send_result=None, send_exc=None):
+def _stub(monkeypatch, targets=None, send_result=None, send_exc=None, new=PAGE):
     async def fake_list_targets(url):
         if targets is None:
             raise RuntimeError("connection refused")
         return targets
+
+    async def fake_new_target(url):
+        if targets is None:
+            raise RuntimeError("connection refused")
+        return new
 
     async def fake_send(ws_url, method, params=None):
         if send_exc is not None:
@@ -32,6 +37,7 @@ def _stub(monkeypatch, targets=None, send_result=None, send_exc=None):
         return send_result
 
     monkeypatch.setattr(server.cdp, "list_targets", fake_list_targets)
+    monkeypatch.setattr(server.cdp, "new_target", fake_new_target)
     monkeypatch.setattr(server.cdp, "send", fake_send)
 
 
@@ -58,7 +64,7 @@ def test_ping_disconnected(monkeypatch):
 
 def test_cdp_command_raw_passthrough(monkeypatch):
     _stub(monkeypatch, targets=[PAGE], send_result={"root": {"nodeId": 1}})
-    out = asyncio.run(_fn(server.cdp_command)("DOM.getDocument", {"depth": 1}))
+    out = asyncio.run(_fn(server.cdp_command)("DOM.getDocument", "T1", {"depth": 1}))
     assert out == {
         "tab_id": "T1",
         "method": "DOM.getDocument",
@@ -75,13 +81,13 @@ def test_cdp_command_reports_cdp_error(monkeypatch):
 
     monkeypatch.setattr(server.cdp, "list_targets", fake_list_targets)
     monkeypatch.setattr(server.cdp, "send", fake_send)
-    out = asyncio.run(_fn(server.cdp_command)("Nope.method"))
+    out = asyncio.run(_fn(server.cdp_command)("Nope.method", "T1"))
     assert "CDP error" in out["error"]
 
 
 def test_evaluate_returns_value(monkeypatch):
     _stub(monkeypatch, targets=[PAGE], send_result={"result": {"type": "number", "value": 42}})
-    out = asyncio.run(_fn(server.evaluate)("1 + 41"))
+    out = asyncio.run(_fn(server.evaluate)("1 + 41", "T1"))
     assert out == {"tab_id": "T1", "value": 42, "type": "number"}
 
 
@@ -91,26 +97,26 @@ def test_evaluate_reports_js_exception(monkeypatch):
         targets=[PAGE],
         send_result={"exceptionDetails": {"exception": {"description": "ReferenceError: x"}}},
     )
-    out = asyncio.run(_fn(server.evaluate)("x"))
+    out = asyncio.run(_fn(server.evaluate)("x", "T1"))
     assert "JS exception" in out["error"]
     assert "ReferenceError" in out["error"]
 
 
 def test_evaluate_reports_unreachable_chrome(monkeypatch):
     _stub(monkeypatch, targets=None)
-    out = asyncio.run(_fn(server.evaluate)("1"))
+    out = asyncio.run(_fn(server.evaluate)("1", "T1"))
     assert "cannot reach Chrome" in out["error"]
 
 
 def test_evaluate_reports_cdp_error(monkeypatch):
     _stub(monkeypatch, targets=[PAGE], send_exc=server.cdp.CDPError("bad domain"))
-    out = asyncio.run(_fn(server.evaluate)("1"))
+    out = asyncio.run(_fn(server.evaluate)("1", "T1"))
     assert out["error"] == "CDP error: bad domain"
 
 
 def test_evaluate_reports_generic_failure(monkeypatch):
     _stub(monkeypatch, targets=[PAGE], send_exc=RuntimeError("socket died"))
-    out = asyncio.run(_fn(server.evaluate)("1"))
+    out = asyncio.run(_fn(server.evaluate)("1", "T1"))
     assert "evaluate failed" in out["error"]
     assert "socket died" in out["error"]
 
@@ -122,7 +128,7 @@ def test_evaluate_falls_back_to_text_for_exception(monkeypatch):
         targets=[PAGE],
         send_result={"exceptionDetails": {"text": "Uncaught"}},
     )
-    out = asyncio.run(_fn(server.evaluate)("throw 1"))
+    out = asyncio.run(_fn(server.evaluate)("throw 1", "T1"))
     assert out["error"] == "JS exception: Uncaught"
 
 
@@ -166,10 +172,26 @@ def test_navigate_reports_generic_failure(monkeypatch):
 
 # --- _resolve_target error branches (surfaced through navigate) -----------
 
-def test_navigate_no_page_targets(monkeypatch):
-    _stub(monkeypatch, targets=[])
+def test_navigate_opens_a_new_tab_when_tab_id_omitted(monkeypatch):
+    fresh = {**PAGE, "id": "NEW", "webSocketDebuggerUrl": "ws://new"}
+    seen = []
+
+    async def fake_send(ws_url, method, params=None):
+        seen.append(ws_url)
+        return {"frameId": "F1"}
+
+    _stub(monkeypatch, targets=[PAGE], new=fresh)
+    monkeypatch.setattr(server.cdp, "send", fake_send)
     out = asyncio.run(_fn(server.navigate)("https://example.com"))
-    assert out["error"] == "no page targets open"
+    assert out["tab_id"] == "NEW"
+    assert seen == ["ws://new"]
+
+
+def test_navigate_reports_a_new_tab_failure(monkeypatch):
+    _stub(monkeypatch, targets=None)
+    out = asyncio.run(_fn(server.navigate)("https://example.com"))
+    assert "cannot open a new tab" in out["error"]
+    assert "connection refused" in out["error"]
 
 
 def test_navigate_unknown_tab_id(monkeypatch):
@@ -181,7 +203,7 @@ def test_navigate_unknown_tab_id(monkeypatch):
 def test_navigate_target_without_ws_url(monkeypatch):
     detached = {"id": "T2", "type": "page", "title": "y", "url": "about:blank"}
     _stub(monkeypatch, targets=[detached])
-    out = asyncio.run(_fn(server.navigate)("https://example.com"))
+    out = asyncio.run(_fn(server.navigate)("https://example.com", tab_id="T2"))
     assert "webSocketDebuggerUrl" in out["error"]
 
 
@@ -196,13 +218,13 @@ def test_navigate_picks_requested_tab(monkeypatch):
 
 def test_cdp_command_reports_unreachable_chrome(monkeypatch):
     _stub(monkeypatch, targets=None)
-    out = asyncio.run(_fn(server.cdp_command)("DOM.getDocument"))
+    out = asyncio.run(_fn(server.cdp_command)("DOM.getDocument", "T1"))
     assert "cannot reach Chrome" in out["error"]
 
 
 def test_cdp_command_reports_generic_failure(monkeypatch):
     _stub(monkeypatch, targets=[PAGE], send_exc=RuntimeError("boom"))
-    out = asyncio.run(_fn(server.cdp_command)("DOM.getDocument"))
+    out = asyncio.run(_fn(server.cdp_command)("DOM.getDocument", "T1"))
     assert "CDP command failed" in out["error"]
     assert "boom" in out["error"]
 
@@ -339,7 +361,7 @@ def test_browse_returns_the_post_navigation_url_not_the_requested_one(monkeypatc
 def test_browse_reports_an_unreachable_chrome(monkeypatch):
     _stub(monkeypatch, targets=None)
     out = asyncio.run(_fn(server.browse)("http://a/"))
-    assert "cannot reach Chrome" in out["error"]
+    assert "cannot open a new tab" in out["error"]
 
 
 def test_browse_reports_a_navigation_failure(monkeypatch):
@@ -373,29 +395,29 @@ def test_browse_view_snapshots_without_navigating(monkeypatch):
     monkeypatch.setattr(server.cdp, "list_targets", fake_list_targets)
     monkeypatch.setattr(server.cdp, "send", fake_send)
     _stub_browse(monkeypatch)
-    out = asyncio.run(_fn(server.browse_view)())
+    out = asyncio.run(_fn(server.browse_view)("T1"))
     assert out["tab_id"] == "T1"
     assert out["refs"] == 1
     assert "Page.navigate" not in calls
 
 
-def test_browse_view_reports_no_tabs(monkeypatch):
+def test_browse_view_reports_an_unknown_tab(monkeypatch):
     _stub(monkeypatch, targets=[])
-    out = asyncio.run(_fn(server.browse_view)())
-    assert out["error"] == "no page targets open"
+    out = asyncio.run(_fn(server.browse_view)("T1"))
+    assert out["error"] == "tab T1 not found"
 
 
 def test_browse_view_reports_a_snapshot_failure(monkeypatch):
     _stub(monkeypatch, targets=[PAGE], send_result={})
     _stub_browse(monkeypatch, snapshot_exc=RuntimeError("tree gone"))
-    out = asyncio.run(_fn(server.browse_view)())
+    out = asyncio.run(_fn(server.browse_view)("T1"))
     assert "snapshot failed" in out["error"]
 
 
 def test_browse_act_returns_steps_and_a_fresh_view(monkeypatch):
     _stub(monkeypatch, targets=[PAGE], send_result={})
     _stub_browse(monkeypatch, steps=[{"do": "click", "ok": True}])
-    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}]))
+    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}], "T1"))
     assert out["steps"] == [{"do": "click", "ok": True}]
     assert "error" not in out
     assert out["refs"] == 1
@@ -406,14 +428,14 @@ def test_browse_act_surfaces_the_error_and_still_returns_a_view(monkeypatch):
     _stub_browse(monkeypatch,
                  steps=[{"do": "click", "ok": False, "error": "ref 1 is stale"}],
                  error="ref 1 is stale")
-    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}]))
+    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}], "T1"))
     assert out["error"] == "ref 1 is stale"
     assert out["view"]
 
 
 def test_browse_act_reports_an_unreachable_chrome(monkeypatch):
     _stub(monkeypatch, targets=None)
-    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}]))
+    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}], "T1"))
     assert "cannot reach Chrome" in out["error"]
 
 
@@ -421,7 +443,7 @@ def test_browse_act_reports_a_snapshot_failure_after_acting(monkeypatch):
     _stub(monkeypatch, targets=[PAGE], send_result={})
     _stub_browse(monkeypatch, steps=[{"do": "click", "ok": True}],
                  snapshot_exc=RuntimeError("tree gone"))
-    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}]))
+    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}], "T1"))
     assert "snapshot failed" in out["error"]
     assert out["steps"] == [{"do": "click", "ok": True}]
 
@@ -432,6 +454,54 @@ def test_browse_act_reports_an_action_batch_failure(monkeypatch):
     already is."""
     _stub(monkeypatch, targets=[PAGE], send_result={})
     _stub_browse(monkeypatch, run_actions_exc=RuntimeError("registry corrupted"))
-    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}]))
+    out = asyncio.run(_fn(server.browse_act)([{"do": "click", "ref": 1}], "T1"))
     assert out["tab_id"] == "T1"
     assert out["error"] == "action batch failed: registry corrupted"
+
+
+def test_browse_in_an_existing_tab_does_not_open_a_new_one(monkeypatch):
+    _stub(monkeypatch, targets=[PAGE], send_result={}, new=None)
+    _stub_browse(monkeypatch)
+
+    async def fake_settle(ws_url, timeout=2.0):
+        return None
+
+    monkeypatch.setattr(server.actions, "settle", fake_settle)
+    out = asyncio.run(_fn(server.browse)("http://a/", tab_id="T1"))
+    assert out["tab_id"] == "T1"
+
+
+# --- close_tab --------------------------------------------------------------
+
+def test_close_tab_closes_and_forgets_the_refs(monkeypatch):
+    _stub(monkeypatch, targets=[PAGE])
+    closed = []
+
+    async def fake_close_target(url, target_id):
+        closed.append(target_id)
+
+    monkeypatch.setattr(server.cdp, "close_target", fake_close_target)
+    server.browse_engine.REGISTRY["T1"] = object()
+    server.browse_engine._lock_for("T1")
+    out = asyncio.run(_fn(server.close_tab)("T1"))
+    assert out == {"tab_id": "T1", "closed": True}
+    assert closed == ["T1"]
+    assert "T1" not in server.browse_engine.REGISTRY
+    assert "T1" not in server.browse_engine._LOCKS
+
+
+def test_close_tab_reports_an_unknown_tab(monkeypatch):
+    _stub(monkeypatch, targets=[PAGE])
+    out = asyncio.run(_fn(server.close_tab)("ZZ"))
+    assert out["error"] == "tab ZZ not found"
+
+
+def test_close_tab_reports_a_close_failure(monkeypatch):
+    _stub(monkeypatch, targets=[PAGE])
+
+    async def fake_close_target(url, target_id):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(server.cdp, "close_target", fake_close_target)
+    out = asyncio.run(_fn(server.close_tab)("T1"))
+    assert out["error"] == "cannot close tab T1: boom"

@@ -40,9 +40,15 @@ REGISTRY: dict[str, _Snapshot] = {}
 # browse/browse_view calls on one tab must not race to replace REGISTRY[tab_id]
 # — whichever registry-write lands last would silently invalidate the refs just
 # handed to the caller whose write didn't. Keyed per tab, never global, so
-# unrelated tabs never wait on each other. Entries are never pruned, like
-# REGISTRY itself — see the note in CLAUDE.md.
+# unrelated tabs never wait on each other. Entries are pruned only by
+# ``forget`` (called by the ``close_tab`` tool), like REGISTRY itself.
 _LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def forget(tab_id: str) -> None:
+    """Drop a closed tab's registry entry and lock."""
+    REGISTRY.pop(tab_id, None)
+    _LOCKS.pop(tab_id, None)
 
 
 def _lock_for(tab_id: str) -> asyncio.Lock:

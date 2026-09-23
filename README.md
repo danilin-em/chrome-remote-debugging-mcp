@@ -35,11 +35,16 @@ Example `mcpServers` entry:
 | `ping`      | —                           | `{connected, cdp_url, browser, protocol}` |
 | `list_tabs` | —                           | `{"tabs": [{id, title, url, type}, ...]}` |
 | `navigate`  | `url`, `tab_id?`            | `{tab_id, url, frameId}`                  |
-| `evaluate`  | `expression`, `tab_id?`     | `{tab_id, value, type}`                   |
-| `cdp_command` | `method`, `params?`, `tab_id?` | `{tab_id, method, result}`           |
+| `evaluate`  | `expression`, `tab_id`      | `{tab_id, value, type}`                   |
+| `cdp_command` | `method`, `tab_id`, `params?` | `{tab_id, method, result}`            |
 | `browse`      | `url`, `tab_id?`                | `{tab_id, url, view, refs}`               |
-| `browse_view` | `tab_id?`                       | `{tab_id, view, refs}`                    |
-| `browse_act`  | `actions_list`, `tab_id?`       | `{tab_id, steps, view, refs}`             |
+| `browse_view` | `tab_id`                        | `{tab_id, view, refs}`                    |
+| `browse_act`  | `actions_list`, `tab_id`        | `{tab_id, steps, view, refs}`             |
+| `close_tab`   | `tab_id`                        | `{tab_id, closed}`                        |
+
+`navigate` and `browse` open a **new tab** when `tab_id` is omitted and return its
+id; every other tab-scoped tool requires an explicit `tab_id`. Close tabs you are
+done with via `close_tab`.
 
 `cdp_command` is a raw CDP escape hatch: pass any CDP `method` + `params` and get
 the raw response, for cases the typed tools above don't cover. It targets a *page*

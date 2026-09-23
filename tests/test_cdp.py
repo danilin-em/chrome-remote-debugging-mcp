@@ -138,3 +138,39 @@ def test_get_version_raises_on_http_error(monkeypatch):
 
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(cdp.get_version("http://localhost:9222"))
+
+
+def test_new_target_puts_json_new_with_about_blank(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["method"] = request.method
+        return httpx.Response(200, json={"id": "N", "type": "page"})
+
+    _mock_http(monkeypatch, handler)
+    out = asyncio.run(cdp.new_target("http://localhost:9222"))
+
+    assert out == {"id": "N", "type": "page"}
+    assert seen["url"] == "http://localhost:9222/json/new?about:blank"
+    assert seen["method"] == "PUT"
+
+
+def test_close_target_hits_json_close(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        return httpx.Response(200, text="Target is closing")
+
+    _mock_http(monkeypatch, handler)
+    asyncio.run(cdp.close_target("http://localhost:9222", "T1"))
+
+    assert seen["url"] == "http://localhost:9222/json/close/T1"
+
+
+def test_close_target_raises_on_http_error(monkeypatch):
+    _mock_http(monkeypatch, lambda request: httpx.Response(404, text="No such target id"))
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(cdp.close_target("http://localhost:9222", "ZZ"))

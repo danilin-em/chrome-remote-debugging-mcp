@@ -46,6 +46,27 @@ async def get_version(cdp_url: str) -> dict:
         return resp.json()
 
 
+async def new_target(cdp_url: str) -> dict:
+    """Open a new blank tab via ``PUT {cdp_url}/json/new?about:blank``.
+
+    Returns the new target dict (same shape as a ``/json/list`` entry). Always
+    opens ``about:blank`` — callers navigate with ``Page.navigate`` afterwards,
+    which sidesteps escaping an arbitrary url into the query string. Chrome
+    111+ refuses ``GET`` here, hence ``PUT``.
+    """
+    async with httpx.AsyncClient() as client:
+        resp = await client.put(f"{cdp_url}/json/new?about:blank", timeout=10.0)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def close_target(cdp_url: str, target_id: str) -> None:
+    """Close a target via ``GET {cdp_url}/json/close/{target_id}``."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"{cdp_url}/json/close/{target_id}", timeout=10.0)
+        resp.raise_for_status()
+
+
 async def send(ws_url: str, method: str, params: dict | None = None) -> dict:
     """Open ``ws_url``, run one CDP command, and return its ``result``.
 

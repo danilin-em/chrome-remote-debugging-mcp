@@ -53,31 +53,44 @@ async def _page_targets() -> list[dict]:
     return [t for t in targets if t.get("type") == "page"]
 
 
-async def _resolve_target(tab_id: str | None) -> tuple[dict, str]:
-    """Resolve ``tab_id`` (or the first page tab) to ``(target, ws_url)``.
+async def _resolve_target(tab_id: str) -> tuple[dict, str]:
+    """Resolve ``tab_id`` to ``(target, ws_url)``.
 
     Raises :class:`_TargetError` with a human-readable message when Chrome is
-    unreachable, no tabs are open, the id is unknown, or the target is not
-    attachable.
+    unreachable, the id is unknown, or the target is not attachable.
     """
     try:
         pages = await _page_targets()
     except Exception as exc:  # network / HTTP failure
         raise _TargetError(f"cannot reach Chrome at {CDP_URL}: {exc}")
-    if not pages:
-        raise _TargetError("no page targets open")
 
+    target = next((t for t in pages if t.get("id") == tab_id), None)
+    if target is None:
+        raise _TargetError(f"tab {tab_id} not found")
+    return target, _ws_url(target)
+
+
+async def _open_target() -> tuple[dict, str]:
+    """Open a new blank tab and return ``(target, ws_url)``."""
+    try:
+        target = await cdp.new_target(CDP_URL)
+    except Exception as exc:
+        raise _TargetError(f"cannot open a new tab at {CDP_URL}: {exc}")
+    return target, _ws_url(target)
+
+
+async def _target_or_new(tab_id: str | None) -> tuple[dict, str]:
+    """``tab_id``'s target, or a freshly opened tab when ``tab_id`` is None."""
     if tab_id is None:
-        target = pages[0]
-    else:
-        target = next((t for t in pages if t.get("id") == tab_id), None)
-        if target is None:
-            raise _TargetError(f"tab {tab_id} not found")
+        return await _open_target()
+    return await _resolve_target(tab_id)
 
+
+def _ws_url(target: dict) -> str:
     ws_url = target.get("webSocketDebuggerUrl")
     if not ws_url:
         raise _TargetError("target has no webSocketDebuggerUrl (already attached?)")
-    return target, ws_url
+    return ws_url
 
 
 @mcp.tool()
@@ -128,11 +141,12 @@ async def list_tabs() -> dict:
 async def navigate(url: str, tab_id: str | None = None) -> dict:
     """Navigate a Chrome tab to ``url``.
 
-    Uses the first page tab when ``tab_id`` is omitted. Returns
-    ``{"tab_id", "url", "frameId"}`` on success, ``{"error": ...}`` otherwise.
+    Opens a new tab when ``tab_id`` is omitted; pass the returned ``tab_id`` to
+    later calls to keep working in it. Returns ``{"tab_id", "url", "frameId"}``
+    on success, ``{"error": ...}`` otherwise.
     """
     try:
-        target, ws_url = await _resolve_target(tab_id)
+        target, ws_url = await _target_or_new(tab_id)
     except _TargetError as exc:
         return {"error": str(exc)}
 
@@ -147,10 +161,10 @@ async def navigate(url: str, tab_id: str | None = None) -> dict:
 
 
 @mcp.tool()
-async def evaluate(expression: str, tab_id: str | None = None) -> dict:
+async def evaluate(expression: str, tab_id: str) -> dict:
     """Evaluate a JavaScript ``expression`` in a Chrome tab.
 
-    Uses the first page tab when ``tab_id`` is omitted. Awaits promises and
+    Awaits promises and
     returns the value by value. Returns ``{"tab_id", "value", "type"}`` on
     success, or ``{"error": ...}`` on failure or an uncaught JS exception.
     """
@@ -184,15 +198,13 @@ async def evaluate(expression: str, tab_id: str | None = None) -> dict:
 
 
 @mcp.tool()
-async def cdp_command(
-    method: str, params: dict | None = None, tab_id: str | None = None
-) -> dict:
+async def cdp_command(method: str, tab_id: str, params: dict | None = None) -> dict:
     """Send a raw CDP command and return its raw result — escape hatch.
 
     Use when the higher-level tools don't cover what you need. ``method`` is any
     CDP method (e.g. ``"Page.captureScreenshot"``, ``"DOM.getDocument"``,
     ``"Network.enable"``); ``params`` are its parameters. Runs against the given
-    tab (or the first page tab). Note: this targets a *page* websocket, so
+    tab. Note: this targets a *page* websocket, so
     page-domain methods work; browser-level domains (``Browser.*``, ``Target.*``)
     do not. Returns ``{"tab_id", "method", "result"}`` or ``{"error": ...}``.
     """
@@ -219,11 +231,12 @@ async def browse(url: str, tab_id: str | None = None) -> dict:
     would announce — not from HTML, so it is compact enough to act on. Every
     interactive element gets a ``#N`` ref usable with ``browse_act``.
 
-    Uses the first page tab when ``tab_id`` is omitted. Returns
+    Opens a new tab when ``tab_id`` is omitted; pass the returned ``tab_id`` to
+    ``browse_act`` / ``browse_view``. Returns
     ``{"tab_id", "url", "view", "refs"}`` or ``{"error": ...}``.
     """
     try:
-        target, ws_url = await _resolve_target(tab_id)
+        target, ws_url = await _target_or_new(tab_id)
     except _TargetError as exc:
         return {"error": str(exc)}
 
@@ -243,7 +256,7 @@ async def browse(url: str, tab_id: str | None = None) -> dict:
 
 
 @mcp.tool()
-async def browse_view(tab_id: str | None = None) -> dict:
+async def browse_view(tab_id: str) -> dict:
     """Re-read the current page and return a fresh view with fresh refs.
 
     Refs from an earlier view stop being valid once this returns. Returns
@@ -261,7 +274,7 @@ async def browse_view(tab_id: str | None = None) -> dict:
 
 
 @mcp.tool()
-async def browse_act(actions_list: list[dict], tab_id: str | None = None) -> dict:
+async def browse_act(actions_list: list[dict], tab_id: str) -> dict:
     """Run several actions against the current view, then return one new view.
 
     Each action is a dict with a ``do`` key:
@@ -306,6 +319,25 @@ async def browse_act(actions_list: list[dict], tab_id: str | None = None) -> dic
     if error:
         out["error"] = error
     return out
+
+
+@mcp.tool()
+async def close_tab(tab_id: str) -> dict:
+    """Close a Chrome tab opened earlier (e.g. by ``browse`` / ``navigate``).
+
+    Its refs are dropped along with it. Returns ``{"tab_id", "closed": True}``
+    or ``{"error": ...}``.
+    """
+    try:
+        await _resolve_target(tab_id)
+    except _TargetError as exc:
+        return {"error": str(exc)}
+    try:
+        await cdp.close_target(CDP_URL, tab_id)
+    except Exception as exc:
+        return {"error": f"cannot close tab {tab_id}: {exc}"}
+    browse_engine.forget(tab_id)
+    return {"tab_id": tab_id, "closed": True}
 
 
 from . import debuglog  # noqa: E402  DEBUG ONLY — do not commit
