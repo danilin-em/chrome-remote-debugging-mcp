@@ -60,44 +60,49 @@ filtered out by Chrome itself.
 url    https://news.ycombinator.com/
 title  Hacker News
 
-link#1 -> https://news.ycombinator.com/
-link#2 "Hacker News"
-link#3 "new"
-link#4 "past"
-link#5 "comments"
-link#6 "ask"
-link#7 "show"
-link#8 "jobs"
-link#9 "submit"
-link#10 "login"
+link#1 -> #
+link#2 "Hacker News" -> /news
+link#3 "new" -> /newest
+link#4 "past" -> /front
+link#5 "comments" -> /newcomments
+link#6 "ask" -> /ask
+link#7 "show" -> /show
+link#8 "jobs" -> /jobs
+link#9 "submit" -> /submit
+link#10 "login" -> /login?goto=news
 
-      link#11 -> https://news.ycombinator.com/vote?id=49548395&how=up&goto=news
-
-      link#12 "Audacity 4.0"
-      link#13 "github.com/audacity"
-
-      text "362 points"
-      text "by"
-      link#14 "ClydeN"
-      link#15 "2 hours ago"
-      link#16 "hide"
-      link#17 "80 comments"
+  |  |  |  |
+  |---|---|---|
+  | 1. | link#11 -> /vote?id=49546753&how=up&goto=news | link#12 "Pre-Release of Polars 2.0" -> https://pola.rs/posts/announcing-polars-2/ link#13 "pola.rs" -> /from?site=pola.rs |
+  |  | 107 points by link#14 "komape" -> /user?id=komape link#15 "2 hours ago" -> /item?id=49546753 link#16 "hide" -> /hide?id=49546753&goto=news link#17 "18 comments" -> /item?id=49546753 |  |
+  …
 ```
 
-(a real, unedited `browse` view captured live against the front page.
+(the unedited opening of a real view, rendered from the front-page tree captured in
+`tests/fixtures/hn.json.gz`.
 Numbering and printing order follow document order, not Chrome's
 breadth-first `Accessibility.getFullAXTree` array, so the site header's nine
 navigation links print first — refs `#1`-`#10` — and only then the front
-page's first story. That story sits one level inside Hacker News's table
-markup: its vote arrow, its title/domain pair, and its points/byline pair are
-three sibling blocks at the same depth, so all three are indented equally and
-separated only by blank lines — the blank line alone marks the boundary
-between them. Deeper nesting elsewhere in a page indents further, one level
-per block of ancestry — see `block_path` in `ax.py`. The story, ref numbers
-and comment count will differ on any given run; the front page changes
-constantly.)
+page's stories. Those sit in a semantic `<table>`, so they print as a Markdown
+table: each cell's content joined on one line, links keeping their refs. The
+stories, ref numbers and comment counts will differ on any given run; the
+front page changes constantly.)
 
-A blank line separates blocks and indentation shows nesting. Every interactive
+A blank line separates blocks and indentation shows nesting, one level per
+block of ancestry — see `block_path` in `ax.py`. A table (`table`, `grid`,
+`treegrid`) prints as a Markdown grid: its first row is the header when it
+holds a `columnheader`, otherwise the header is left blank; short rows are
+padded (the tree carries no colspan), rows with no content are dropped, and a
+`|` inside a cell is escaped as `\|`.
+
+A link shows where it goes after `->`: just the path when it stays on the
+page's own origin, just `#fragment` when it points at the page itself (a
+`href="#"` tab or toggle prints as `-> #`), the full url otherwise; a url
+longer than 120 characters is cut with `…`. A `combobox`/`listbox` lists its
+options in braces — all of them, e.g. `{один | два}` — and a
+`slider`/`spinbutton` shows its bounds as `[min..max]`.
+
+Every interactive
 element Chrome can address carries a `#N` ref (the rare element with no backend
 DOM id — see the invariants in `CLAUDE.md` — renders without one rather than
 taking a number it can't be resolved back through). Pass those refs to

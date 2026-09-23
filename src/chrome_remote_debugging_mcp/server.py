@@ -308,6 +308,11 @@ async def browse_act(actions_list: list[dict], tab_id: str | None = None) -> dic
     return out
 
 
+from . import debuglog  # noqa: E402  DEBUG ONLY — do not commit
+
+debuglog.install(mcp)
+
+
 def main() -> None:
     """Console-script entry point: run the MCP server over stdio.
 

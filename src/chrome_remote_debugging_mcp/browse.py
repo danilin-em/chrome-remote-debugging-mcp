@@ -127,7 +127,8 @@ async def snapshot(ws_url: str, tab_id: str) -> tuple[str, int, str]:
             nodes = tree.get("nodes", [])
             ax.strip_sources(nodes)
             attrs = await _attributes_for(ws_url, ax.unnamed_backend_ids(nodes))
-            frame_lines, frame_refs = ax.render_nodes(nodes, ref_count, attrs=attrs)
+            frame_lines, frame_refs = ax.render_nodes(nodes, ref_count, attrs=attrs,
+                                                     base_url=url)
             if not frame_lines:
                 continue
             if index > 0:

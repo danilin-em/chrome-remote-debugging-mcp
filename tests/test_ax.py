@@ -152,6 +152,153 @@ def test_format_interactive_omits_empty_value_and_absent_flags():
     assert ax.format_interactive(node, 2, {}) == 'textbox#2 "Поиск"'
 
 
+def _link(name, url):
+    return {"role": {"value": "link"}, "name": {"value": name},
+            "properties": [{"name": "url", "value": {"value": url}}]}
+
+
+def test_format_interactive_appends_a_named_links_url():
+    node = _link("GitHub", "https://github.com/foo")
+    assert ax.format_interactive(node, 1, {}) == 'link#1 "GitHub" -> https://github.com/foo'
+
+
+def test_format_interactive_shortens_a_same_origin_url_to_its_path():
+    base = "https://admin.example.com/admin/player/view/1"
+    same = _link("Игроки", "https://admin.example.com/admin/player/?q=1#top")
+    assert (ax.format_interactive(same, 1, {}, base_url=base)
+            == 'link#1 "Игроки" -> /admin/player/?q=1#top')
+    other = _link("GitHub", "https://github.com/foo")
+    assert (ax.format_interactive(other, 2, {}, base_url=base)
+            == 'link#2 "GitHub" -> https://github.com/foo')
+    other_port = _link("Dev", "https://admin.example.com:8443/x")
+    assert (ax.format_interactive(other_port, 3, {}, base_url=base)
+            == 'link#3 "Dev" -> https://admin.example.com:8443/x')
+    mail = _link("mail", "mailto:a@b.c")
+    assert ax.format_interactive(mail, 4, {}, base_url=base) == 'link#4 "mail" -> mailto:a@b.c'
+
+
+def test_format_interactive_shows_a_link_to_the_current_page_as_its_fragment():
+    base = "https://h.test/player/view/1?tab=a"
+    for url, shown in [("https://h.test/player/view/1?tab=a#", "#"),
+                       ("https://h.test/player/view/1?tab=a", "#"),
+                       ("https://h.test/player/view/1?tab=a#notes", "#notes"),
+                       ("https://h.test/player/view/1?tab=b", "/player/view/1?tab=b"),
+                       ("https://h.test/player/view/2?tab=a", "/player/view/2?tab=a")]:
+        assert (ax.format_interactive(_link("x", url), 1, {}, base_url=base)
+                == f'link#1 "x" -> {shown}')
+
+
+def test_format_interactive_truncates_a_long_url():
+    long = "https://h.test/sessions?filter=" + "a%3A1" * 60
+    line = ax.format_interactive(_link("История", long), 1, {}, base_url="https://h.test/")
+    shown = line.split(" -> ")[1]
+    assert len(shown) == ax.MAX_URL
+    assert shown == ("/sessions?filter=" + "a%3A1" * 60)[:ax.MAX_URL - 1] + "…"
+    unnamed = ax.format_interactive(_link("", long), 2, {}, base_url="https://h.test/")
+    assert unnamed == f"link#2 -> {shown}"
+    exact = "https://x.test/" + "b" * (ax.MAX_URL - len("https://x.test/"))
+    assert ax.format_interactive(_link("y", exact), 3, {}) == f'link#3 "y" -> {exact}'
+
+
+def test_format_interactive_keeps_a_root_slash_for_a_bare_origin_url():
+    node = _link("Home", "https://admin.example.com")
+    assert (ax.format_interactive(node, 1, {}, base_url="https://admin.example.com/a")
+            == 'link#1 "Home" -> /')
+
+
+def test_format_interactive_does_not_repeat_a_url_used_as_the_label():
+    node = _link("", "https://admin.example.com/v?id=1")
+    assert (ax.format_interactive(node, 3, {}, base_url="https://admin.example.com/")
+            == "link#3 -> /v?id=1")
+
+
+def test_format_interactive_prints_no_arrow_for_a_link_without_url():
+    node = {"role": {"value": "link"}, "name": {"value": "#"}}
+    assert ax.format_interactive(node, 1, {}) == 'link#1 "#"'
+
+
+def _select(options, role="combobox", value=""):
+    """A select-like node with its options under a MenuListPopup, as Chrome builds it."""
+    nodes = [
+        {"nodeId": "s", "role": {"value": role}, "name": {"value": "Страна"},
+         "value": {"value": value}, "childIds": ["p"]},
+        {"nodeId": "p", "role": {"value": "MenuListPopup"}, "parentId": "s",
+         "childIds": [f"o{i}" for i in range(len(options))]},
+    ]
+    nodes += [{"nodeId": f"o{i}", "role": {"value": "option"}, "name": {"value": name},
+               "parentId": "p"} for i, name in enumerate(options)]
+    return nodes, {n["nodeId"]: n for n in nodes}
+
+
+def test_format_interactive_lists_the_options_of_a_select(probe_nodes):
+    by_id = {n["nodeId"]: n for n in probe_nodes}
+    select = next(n for n in probe_nodes if ax.node_role(n) == "combobox")
+    assert (ax.format_interactive(select, 9, {}, by_id=by_id)
+            == 'combobox#9 [unnamed] = "один" {один | два}')
+
+
+def test_format_interactive_lists_every_option_without_collapsing():
+    names = [f"o{i}" for i in range(13)]
+    nodes, by_id = _select(names, role="listbox")
+    assert (ax.format_interactive(nodes[0], 1, {}, by_id=by_id)
+            == 'listbox#1 "Страна" {' + " | ".join(names) + "}")
+
+
+def test_format_interactive_skips_ignored_and_unnamed_options():
+    nodes, by_id = _select(["a", "", "b"])
+    by_id["o2"]["ignored"] = True
+    assert ax.format_interactive(nodes[0], 1, {}, by_id=by_id) == 'combobox#1 "Страна" {a}'
+
+
+def test_format_interactive_prints_no_braces_without_options():
+    nodes, by_id = _select([])
+    assert ax.format_interactive(nodes[0], 1, {}, by_id=by_id) == 'combobox#1 "Страна"'
+    # Without the tree there is nothing to walk.
+    nodes, _ = _select(["a"])
+    assert ax.format_interactive(nodes[0], 1, {}) == 'combobox#1 "Страна"'
+
+
+def test_format_interactive_survives_a_dangling_child_id():
+    nodes, by_id = _select(["a"])
+    by_id["p"]["childIds"].append("gone")
+    assert ax.format_interactive(nodes[0], 1, {}, by_id=by_id) == 'combobox#1 "Страна" {a}'
+
+
+def _ranged(role, **bounds):
+    return {"role": {"value": role}, "name": {"value": "Громкость"},
+            "value": {"value": "30"},
+            "properties": [{"name": k, "value": {"value": v}} for k, v in bounds.items()]}
+
+
+def test_format_interactive_shows_range_bounds():
+    assert (ax.format_interactive(_ranged("slider", valuemin=0, valuemax=100), 5, {})
+            == 'slider#5 "Громкость" = "30" [0..100]')
+    assert (ax.format_interactive(_ranged("spinbutton", valuemin=1), 6, {})
+            == 'spinbutton#6 "Громкость" = "30" [1..]')
+    assert (ax.format_interactive(_ranged("spinbutton", valuemax=9.5), 7, {})
+            == 'spinbutton#7 "Громкость" = "30" [..9.5]')
+    assert (ax.format_interactive(_ranged("slider"), 8, {})
+            == 'slider#8 "Громкость" = "30"')
+
+
+def test_format_interactive_shows_bounds_before_flags_and_only_for_range_roles():
+    node = _ranged("slider", valuemin=0, valuemax=10)
+    node["properties"].append({"name": "disabled", "value": {"value": True}})
+    assert (ax.format_interactive(node, 1, {})
+            == 'slider#1 "Громкость" = "30" [0..10] [disabled]')
+    textbox = _ranged("textbox", valuemin=0, valuemax=10)
+    assert ax.format_interactive(textbox, 2, {}) == 'textbox#2 "Громкость" = "30"'
+
+
+def test_render_passes_base_url_and_tree_to_interactive_lines(probe_nodes):
+    lines, _ = ax.render_nodes(probe_nodes)
+    assert any(line.strip().endswith("{один | два}") for line in lines)
+    link = dict(_link("Игроки", "https://h.test/players"), nodeId="1",
+                backendDOMNodeId=5)
+    lines, _ = ax.render_nodes([link], base_url="https://h.test/x")
+    assert lines == ['link#1 "Игроки" -> /players']
+
+
 def test_format_structure_prints_named_landmarks_only():
     assert ax.format_structure(
         {"role": {"value": "heading"}, "name": {"value": "Web accessibility"}}
@@ -255,6 +402,52 @@ def test_render_drops_punctuation_text_and_parent_duplicates():
     ]
     lines, _ = ax.render_nodes(nodes)
     assert lines == ['link#1 "Home"', 'text "by"']
+
+
+def test_render_keeps_text_whose_parent_name_is_never_printed():
+    """A table cell's accessible name is computed from its own text, but a
+    cell prints no line of its own — dropping the text as a "duplicate" of
+    it erased every plain-text cell from the view (live admin page, sport
+    bets table: only the id links survived)."""
+    nodes = [
+        {"nodeId": "r", "role": {"value": "row"}, "childIds": ["c1", "c2"]},
+        {"nodeId": "c1", "role": {"value": "cell"}, "name": {"value": "100.00 RU"},
+         "parentId": "r", "childIds": ["t1"]},
+        {"nodeId": "t1", "role": {"value": "StaticText"}, "name": {"value": "100.00 RU"},
+         "parentId": "c1"},
+        {"nodeId": "c2", "role": {"value": "columnheader"}, "name": {"value": "Сумма"},
+         "parentId": "r", "childIds": ["t2"]},
+        {"nodeId": "t2", "role": {"value": "StaticText"}, "name": {"value": "Сумма"},
+         "parentId": "c2"},
+    ]
+    lines, _ = ax.render_nodes(nodes)
+    assert [line.strip() for line in lines if line] == ['text "100.00 RU"', 'text "Сумма"']
+
+
+def test_render_drops_text_only_when_its_parent_prints_that_name():
+    heading = [
+        {"nodeId": "1", "role": {"value": "heading"}, "name": {"value": "Итоги"},
+         "childIds": ["2"]},
+        {"nodeId": "2", "role": {"value": "StaticText"}, "name": {"value": "Итоги"},
+         "parentId": "1"},
+    ]
+    assert ax.render_nodes(heading)[0] == ['heading "Итоги"']
+    # An ignored link prints nothing, so its text must survive.
+    ignored_link = [
+        {"nodeId": "1", "role": {"value": "link"}, "name": {"value": "Home"},
+         "ignored": True, "backendDOMNodeId": 1, "childIds": ["2"]},
+        {"nodeId": "2", "role": {"value": "StaticText"}, "name": {"value": "Home"},
+         "parentId": "1"},
+    ]
+    assert ax.render_nodes(ignored_link)[0] == ['text "Home"']
+    # A link with no backend id still prints `link "Home"` — text is a duplicate.
+    unresolvable_link = [
+        {"nodeId": "1", "role": {"value": "link"}, "name": {"value": "Home"},
+         "childIds": ["2"]},
+        {"nodeId": "2", "role": {"value": "StaticText"}, "name": {"value": "Home"},
+         "parentId": "1"},
+    ]
+    assert ax.render_nodes(unresolvable_link)[0] == ['link "Home"']
 
 
 def test_render_keeps_text_that_differs_from_its_parent_name():
@@ -515,3 +708,208 @@ def test_render_ref_counts_survive_the_ordering_fix(ax_fixture):
     _, wiki_refs = ax.render_nodes(ax_fixture("wikipedia")[0]["nodes"])
     assert len(hn_refs) == 226
     assert len(wiki_refs) == 713
+
+
+# --- Markdown tables -------------------------------------------------------
+
+def _tree(spec, parent=None, out=None):
+    """Build AX nodes from ``(id, role, name, children, extra)`` tuples."""
+    out = [] if out is None else out
+    node_id, role, name, children, extra = (list(spec) + [None, None])[:5]
+    node = {"nodeId": node_id, "role": {"value": role}, "name": {"value": name or ""},
+            "childIds": [c[0] for c in children or []]}
+    if parent is not None:
+        node["parentId"] = parent
+    node.update(extra or {})
+    out.append(node)
+    for child in children or []:
+        _tree(child, node_id, out)
+    return out
+
+
+def _text(node_id, text):
+    return (node_id, "StaticText", text)
+
+
+def _cell(node_id, *children, role="cell"):
+    return (node_id, role, "", list(children))
+
+
+def test_render_prints_a_table_as_markdown_with_its_header_row():
+    nodes = _tree(("t", "table", "", [
+        ("r0", "row", "", [
+            _cell("h1", _text("h1t", "Id"), role="columnheader"),
+            _cell("h2", _text("h2t", "Сумма"), role="columnheader"),
+        ]),
+        ("r1", "row", "", [
+            _cell("c1", ("l1", "link", "6382470", [_text("l1t", "6382470")],
+                         {"backendDOMNodeId": 70,
+                          "properties": [{"name": "url",
+                                          "value": {"value": "https://h.test/bet/1"}}]})),
+            _cell("c2", _text("c2t", "100.00 RU")),
+        ]),
+    ]))
+    lines, refs = ax.render_nodes(nodes, base_url="https://h.test/")
+    assert lines == [
+        "| Id | Сумма |",
+        "|---|---|",
+        '| link#1 "6382470" -> /bet/1 | 100.00 RU |',
+    ]
+    assert refs == {1: 70}
+
+
+def test_render_gives_a_headerless_table_an_empty_header_and_pads_short_rows():
+    nodes = _tree(("t", "table", "", [
+        ("r1", "row", "", [_cell("a", _text("at", "a")), _cell("b", _text("bt", "b"))]),
+        ("r2", "row", "", [_cell("c", _text("ct", "c"))]),
+    ]))
+    assert ax.render_nodes(nodes)[0] == [
+        "|  |  |",
+        "|---|---|",
+        "| a | b |",
+        "| c |  |",
+    ]
+
+
+def test_render_table_joins_cell_content_escapes_pipes_and_drops_empty_rows():
+    nodes = _tree(("t", "grid", "", [
+        ("rg", "rowgroup", "", [
+            ("r1", "row", "", [
+                _cell("a", _text("a1", "12.08.26"), _text("a2", "14:33"), role="gridcell"),
+                _cell("b", _text("b1", "P2P|debug"), role="gridcell"),
+            ]),
+            ("r2", "row", "", [_cell("e1"), _cell("e2")]),
+        ]),
+    ]))
+    assert ax.render_nodes(nodes)[0] == [
+        "|  |  |",
+        "|---|---|",
+        "| 12.08.26 14:33 | P2P\\|debug |",
+    ]
+
+
+def test_render_table_keeps_document_order_refs_before_inside_and_after():
+    def button(node_id, name, backend):
+        return (node_id, "button", name, [], {"backendDOMNodeId": backend})
+    nodes = _tree(("root", "RootWebArea", "", [
+        button("before", "До", 1),
+        ("t", "table", "", [
+            ("r1", "row", "", [_cell("c1", button("in1", "A", 2)),
+                               _cell("c2", button("in2", "B", 3))]),
+        ]),
+        button("after", "После", 4),
+    ]))
+    lines, refs = ax.render_nodes(nodes)
+    assert [line.strip() for line in lines if line] == [
+        'button#1 "До"',
+        "|  |  |",
+        "|---|---|",
+        '| button#2 "A" | button#3 "B" |',
+        'button#4 "После"',
+    ]
+    assert refs == {1: 1, 2: 2, 3: 3, 4: 4}
+
+
+def test_render_table_prints_its_name_and_caption_around_the_grid():
+    nodes = _tree(("t", "table", "Ставки", [
+        ("cap", "caption", "", [_text("capt", "Последние 8")]),
+        ("r1", "row", "", [_cell("c", _text("ct", "x"))]),
+        _text("tail", "итого 1"),
+    ]))
+    assert ax.render_nodes(nodes)[0] == [
+        'table "Ставки"',
+        "",
+        '  text "Последние 8"',
+        "  |  |",
+        "  |---|",
+        "  | x |",
+        '  text "итого 1"',
+    ]
+
+
+def test_render_table_flattens_a_nested_table_and_text_outside_cells():
+    nodes = _tree(("t", "table", "", [
+        ("r1", "row", "", [
+            _text("loose", "вне ячейки"),
+            _cell("c", ("inner", "table", "", [
+                ("ir", "row", "", [_cell("ic1", _text("i1", "x")),
+                                   _cell("ic2", _text("i2", "y"))]),
+            ])),
+        ]),
+    ]))
+    assert ax.render_nodes(nodes)[0] == [
+        "|  |  |",
+        "|---|---|",
+        "| вне ячейки | x y |",
+    ]
+
+
+def test_render_falls_back_to_plain_lines_for_a_table_without_content_rows():
+    nodes = _tree(("t", "table", "Пусто", [
+        ("r1", "row", "", [_cell("c")]),
+        _text("note", "No data"),
+    ]))
+    assert ax.render_nodes(nodes)[0] == ['table "Пусто"', "", '  text "No data"']
+
+
+def test_render_skips_an_ignored_table_wrapper_but_keeps_its_content():
+    nodes = _tree(("t", "table", "", [_text("x", "plain")], {"ignored": True}))
+    assert ax.render_nodes(nodes)[0] == ['text "plain"']
+
+
+def test_render_table_sees_through_wrappers_and_survives_a_repeated_child_id():
+    nodes = _tree(("t", "table", "", [
+        ("r1", "row", "", [
+            ("w", "generic", "", [_cell("c1", _text("t1", "a"))]),
+            _cell("c2", _text("t2", "b")),
+        ]),
+    ]))
+    by_id = {n["nodeId"]: n for n in nodes}
+    by_id["r1"]["childIds"].append("c2")  # the same cell listed twice
+    assert ax.render_nodes(nodes)[0] == ["|  |  |", "|---|---|", "| a | b |"]
+
+
+# --- R3 duplicate text: nearest meaningful ancestor --------------------------
+
+def test_render_drops_text_duplicating_an_ancestor_behind_wrappers():
+    """Hole 1: `link → generic → StaticText` printed the link's name twice
+    (Wikipedia "Search", YouTube tabs "All") because only the direct parent
+    was compared."""
+    nodes = _tree(("root", "RootWebArea", "", [
+        ("l", "link", "Search", [("w", "generic", "", [_text("t1", "Search")])],
+         {"backendDOMNodeId": 1}),
+        ("tab", "tab", "All", [("w2", "none", "", [
+            ("w3", "generic", "", [_text("t2", "All")], {"ignored": True})])],
+         {"backendDOMNodeId": 2}),
+    ]))
+    assert ax.render_nodes(nodes)[0] == ['link#1 "Search"', 'tab#2 "All"']
+
+
+def test_render_keeps_cell_text_behind_a_wrapper():
+    nodes = _tree(("root", "RootWebArea", "", [
+        ("c", "cell", "100.00 RU", [("w", "generic", "", [_text("t", "100.00 RU")])]),
+    ]))
+    assert ax.render_nodes(nodes)[0] == ['text "100.00 RU"']
+
+
+def test_render_drops_option_text_already_listed_by_its_select():
+    """Hole 4: an ARIA listbox's options carry StaticText; the listbox prints
+    them in braces, so they must not also print as text lines."""
+    nodes = _tree(("root", "RootWebArea", "", [
+        ("lb", "listbox", "Страна", [
+            ("o1", "option", "Россия", [_text("t1", "Россия")]),
+            ("o2", "option", "Сербия", [("w", "generic", "", [_text("t2", "Сербия")])]),
+        ], {"backendDOMNodeId": 1}),
+    ]))
+    lines, _ = ax.render_nodes(nodes)
+    assert [line.strip() for line in lines if line] == ['listbox#1 "Страна" {Россия | Сербия}']
+
+
+def test_render_keeps_option_text_with_no_select_to_list_it():
+    nodes = _tree(("root", "RootWebArea", "", [
+        ("o", "option", "Сирота", [_text("t", "Сирота")]),
+        ("lb", "listbox", "", [("o2", "option", "Скрыт", [_text("t2", "Скрыт")])],
+         {"ignored": True}),
+    ]))
+    lines, _ = ax.render_nodes(nodes)
+    assert [line.strip() for line in lines if line] == ['text "Сирота"', 'text "Скрыт"']

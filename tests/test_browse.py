@@ -98,6 +98,21 @@ def test_snapshot_renders_a_header_and_the_view(monkeypatch):
     assert url == "http://a/"
 
 
+def test_snapshot_shortens_links_against_the_observed_page_url(monkeypatch):
+    links = [
+        {"nodeId": "1", "role": {"value": "link"}, "name": {"value": "Свой"},
+         "backendDOMNodeId": 11,
+         "properties": [{"name": "url", "value": {"value": "http://a/x?y=1"}}]},
+        {"nodeId": "2", "role": {"value": "link"}, "name": {"value": "Чужой"},
+         "backendDOMNodeId": 12,
+         "properties": [{"name": "url", "value": {"value": "http://b/z"}}]},
+    ]
+    _install(monkeypatch, Fake(trees={"F1": links}))
+    view, _, _ = asyncio.run(browse.snapshot(WS, "T1"))
+    assert 'link#1 "Свой" -> /x?y=1' in view
+    assert 'link#2 "Чужой" -> http://b/z' in view
+
+
 def test_snapshot_stores_frame_and_backend_ids_in_the_registry(monkeypatch):
     fake = Fake()
     _install(monkeypatch, fake)
