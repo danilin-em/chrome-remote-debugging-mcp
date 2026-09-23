@@ -340,7 +340,7 @@ async def close_tab(tab_id: str) -> dict:
     return {"tab_id": tab_id, "closed": True}
 
 
-from . import debuglog  # noqa: E402  DEBUG ONLY — do not commit
+from . import debuglog  # noqa: E402
 
 debuglog.install(mcp)
 

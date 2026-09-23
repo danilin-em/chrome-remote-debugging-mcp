@@ -150,6 +150,7 @@ For a page whose content arrives after load — most single-page applications �
 | Env var   | Default                   | Meaning                        |
 |-----------|---------------------------|--------------------------------|
 | `CDP_URL` | `http://localhost:9222`   | Chrome remote-debugging origin |
+| `MCP_DEBUG_LOG` | unset (off)         | Log every tool call — arguments, result, duration — to a file. `1`/`true`/`yes`/`on` → `/tmp/chrome-remote-debugging-mcp.log`; any other value is the log file path; `0`/`false`/`no`/`off` or empty → off. Read once at startup. |
 
 ## SSH tunnel (optional)
 
