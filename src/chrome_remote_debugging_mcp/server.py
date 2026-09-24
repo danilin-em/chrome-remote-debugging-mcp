@@ -184,6 +184,7 @@ async def evaluate(expression: str, tab_id: str) -> dict:
     Awaits promises and
     returns the value by value. Returns ``{"tab_id", "value", "type"}`` on
     success, or ``{"error": ...}`` on failure or an uncaught JS exception.
+    A promise that does not settle within 30 s is reported as an error.
     """
     try:
         target, ws_url = await _resolve_target(tab_id)

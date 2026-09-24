@@ -174,3 +174,42 @@ def test_close_target_raises_on_http_error(monkeypatch):
 
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(cdp.close_target("http://localhost:9222", "ZZ"))
+
+
+class HangingWS(FakeWS):
+    """A socket that accepts the command but never answers — a stalled tunnel."""
+
+    async def recv(self):
+        await asyncio.Event().wait()
+
+
+def test_send_times_out_when_no_response_arrives(monkeypatch):
+    _patch(monkeypatch, HangingWS([]))
+    with pytest.raises(cdp.CDPTimeout, match=r"no response to DOM\.getDocument within 0\.01s"):
+        asyncio.run(cdp.send("ws://x", "DOM.getDocument", timeout=0.01))
+
+
+def test_send_uses_module_default_timeout(monkeypatch):
+    _patch(monkeypatch, HangingWS([]))
+    monkeypatch.setattr(cdp, "SEND_TIMEOUT", 0.01)
+    with pytest.raises(cdp.CDPTimeout):
+        asyncio.run(cdp.send("ws://x", "Page.navigate"))
+
+
+def test_send_times_out_despite_a_stream_of_unrelated_events(monkeypatch):
+    # The deadline covers the whole exchange, not each recv(): events that
+    # keep arriving must not keep the call alive forever.
+    class ChattyWS(FakeWS):
+        async def recv(self):
+            await asyncio.sleep(0.001)
+            return json.dumps({"method": "Network.dataReceived", "params": {}})
+
+    _patch(monkeypatch, ChattyWS([]))
+    with pytest.raises(cdp.CDPTimeout):
+        asyncio.run(cdp.send("ws://x", "Page.navigate", timeout=0.05))
+
+
+def test_timeout_is_not_a_cdp_error():
+    # actions.py turns CDPError into "stale ref"; a stalled transport must not
+    # be misdiagnosed that way.
+    assert not issubclass(cdp.CDPTimeout, cdp.CDPError)

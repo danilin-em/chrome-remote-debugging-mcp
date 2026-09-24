@@ -7,6 +7,7 @@ WebSocket. No MCP awareness lives here, which keeps it independently testable.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 
@@ -17,9 +18,23 @@ import websockets
 # can reset it via monkeypatch for deterministic frame assertions.
 _ids = itertools.count(1)
 
+# Deadline for one whole send() exchange (connect, command, matching reply).
+# Without it a stalled transport — e.g. an ssh tunnel whose peer vanished but
+# whose process has not yet noticed — would hang the tool call indefinitely.
+# Generous because Runtime.evaluate with awaitPromise legitimately waits.
+SEND_TIMEOUT = 30.0
+
 
 class CDPError(Exception):
     """Raised when Chrome returns a CDP-level ``error`` for a command."""
+
+
+class CDPTimeout(TimeoutError):
+    """Raised when a command gets no reply in time.
+
+    Deliberately *not* a :class:`CDPError`: callers treat CDPError as "Chrome
+    rejected this", and a silent transport is a different failure.
+    """
 
 
 async def list_targets(cdp_url: str) -> list[dict]:
@@ -67,13 +82,24 @@ async def close_target(cdp_url: str, target_id: str) -> None:
         resp.raise_for_status()
 
 
-async def send(ws_url: str, method: str, params: dict | None = None) -> dict:
+async def send(ws_url: str, method: str, params: dict | None = None,
+               *, timeout: float | None = None) -> dict:
     """Open ``ws_url``, run one CDP command, and return its ``result``.
 
     Unrelated CDP events (which have no matching ``id``) are skipped until the
-    response for this command arrives. Raises :class:`CDPError` on a CDP error.
+    response for this command arrives. Raises :class:`CDPError` on a CDP error
+    and :class:`CDPTimeout` if the whole exchange exceeds ``timeout`` seconds
+    (default :data:`SEND_TIMEOUT`).
     """
     command = {"id": next(_ids), "method": method, "params": params or {}}
+    limit = SEND_TIMEOUT if timeout is None else timeout
+    try:
+        return await asyncio.wait_for(_exchange(ws_url, command), limit)
+    except asyncio.TimeoutError:
+        raise CDPTimeout(f"no response to {method} within {limit}s") from None
+
+
+async def _exchange(ws_url: str, command: dict) -> dict:
     async with websockets.connect(ws_url, max_size=None) as ws:
         await ws.send(json.dumps(command))
         while True:
