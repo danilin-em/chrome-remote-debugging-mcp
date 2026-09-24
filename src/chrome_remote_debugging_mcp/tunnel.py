@@ -69,6 +69,10 @@ class SshLocalForwardTunnel:
         self.local_port = local_port if (local_port is not None and local_port > 0) else _pick_free_port()
         self._connect_timeout = connect_timeout
         self._proc: subprocess.Popen[str] | None = None
+        self._atexit_registered = False
+        # Serialises ensure_alive(): concurrent tool calls run it in worker
+        # threads, and two of them must not both respawn ssh on the same port.
+        self._restart_lock = threading.Lock()
 
     @property
     def local_url(self) -> str:
@@ -117,7 +121,9 @@ class SshLocalForwardTunnel:
             text=True,
         )
         # Ensure the child never outlives us even on an unclean exit.
-        atexit.register(self.stop)
+        if not self._atexit_registered:
+            atexit.register(self.stop)
+            self._atexit_registered = True
 
         deadline = time.monotonic() + self._connect_timeout
         while time.monotonic() < deadline:
@@ -137,6 +143,23 @@ class SshLocalForwardTunnel:
         raise RuntimeError(
             f"ssh tunnel to {self.target} not ready within {self._connect_timeout:.0f}s"
         )
+
+    def ensure_alive(self) -> None:
+        """Respawn ssh on the same local port if it has exited since ``start()``.
+
+        ssh dies on its own when the connection drops (``ServerAlive*``), and
+        nothing else notices: without this, every later tool call would fail
+        with a bare "connection refused" on the local port until the whole
+        server is restarted. Keeping the port means ``CDP_URL`` stays valid.
+        A tunnel that was never started or was ``stop()``-ed is left alone.
+        Raises ``RuntimeError`` (from ``start()``) if the respawn fails.
+        """
+        with self._restart_lock:
+            proc = self._proc
+            if proc is None or proc.poll() is None:
+                return
+            _log(f"ssh exited (code {proc.returncode}); restarting")
+            self.start()
 
     def stop(self) -> None:
         """Terminate the ssh child (idempotent)."""

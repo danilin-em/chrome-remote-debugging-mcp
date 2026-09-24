@@ -7,6 +7,7 @@ Run over stdio (the default transport) as a console script or via
 
 from __future__ import annotations
 
+import asyncio
 import os
 from urllib.parse import urlparse
 
@@ -39,6 +40,8 @@ def _split_endpoint(url: str) -> tuple[str, int]:
 CDP_URL = os.environ.get("CDP_URL", "http://localhost:9222")
 SSH_PROXY_TO = os.environ.get("SSH_PROXY_TO") or None
 SSH_PROXY_PORT = _env_int("SSH_PROXY_PORT")
+# The live tunnel while main() is serving, else None.
+_TUNNEL: SshLocalForwardTunnel | None = None
 
 mcp = FastMCP("chrome-remote-debugging-mcp")
 
@@ -47,8 +50,20 @@ class _TargetError(Exception):
     """Raised when a usable page target can't be resolved (reported as error)."""
 
 
+async def _ensure_tunnel() -> None:
+    """Respawn the ssh tunnel if it died; no-op when there is no tunnel.
+
+    Runs in a worker thread because a respawn blocks for up to the tunnel's
+    connect timeout. Raises ``RuntimeError`` if the respawn fails; callers
+    already turn any exception here into an ``{"error": ...}`` payload.
+    """
+    if _TUNNEL is not None:
+        await asyncio.to_thread(_TUNNEL.ensure_alive)
+
+
 async def _page_targets() -> list[dict]:
     """Return only the ``page`` targets from Chrome (i.e. real tabs)."""
+    await _ensure_tunnel()
     targets = await cdp.list_targets(CDP_URL)
     return [t for t in targets if t.get("type") == "page"]
 
@@ -73,6 +88,7 @@ async def _resolve_target(tab_id: str) -> tuple[dict, str]:
 async def _open_target() -> tuple[dict, str]:
     """Open a new blank tab and return ``(target, ws_url)``."""
     try:
+        await _ensure_tunnel()
         target = await cdp.new_target(CDP_URL)
     except Exception as exc:
         raise _TargetError(f"cannot open a new tab at {CDP_URL}: {exc}")
@@ -102,6 +118,7 @@ async def ping() -> dict:
     is unreachable.
     """
     try:
+        await _ensure_tunnel()
         info = await cdp.get_version(CDP_URL)
     except Exception as exc:
         return {"connected": False, "cdp_url": CDP_URL, "error": str(exc)}
@@ -351,19 +368,22 @@ def main() -> None:
     When ``SSH_PROXY_TO`` is set, open an ``ssh -L`` tunnel to the CDP endpoint
     first and repoint ``CDP_URL`` at the forwarded local port, so every tool
     (which reads ``CDP_URL`` at call time) transparently egresses through the
-    remote host. The tunnel lives exactly as long as the server.
+    remote host. The tunnel lives exactly as long as the server; if ssh dies
+    in between, the next tool call respawns it on the same port.
     """
-    global CDP_URL
+    global CDP_URL, _TUNNEL
     tunnel: SshLocalForwardTunnel | None = None
     if SSH_PROXY_TO:
         host, port = _split_endpoint(CDP_URL)
         tunnel = SshLocalForwardTunnel(SSH_PROXY_TO, host, port, SSH_PROXY_PORT)
         tunnel.start()
         CDP_URL = tunnel.local_url
+        _TUNNEL = tunnel
     try:
         mcp.run()
     finally:
         if tunnel is not None:
+            _TUNNEL = None
             tunnel.stop()
 
 

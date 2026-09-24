@@ -274,3 +274,97 @@ def test_start_success_then_stop_terminates(monkeypatch):
     t.stop()
     assert fake.terminated is True
     assert t._proc is None
+
+
+# --- ensure_alive: lazy restart of a dead ssh child ----------------------------
+
+class _LifecycleProc:
+    """A fake ssh child whose liveness the test flips by hand."""
+
+    def __init__(self, returncode=None):
+        self.stderr = iter([])
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+
+def _started_tunnel(monkeypatch, spawned):
+    from chrome_remote_debugging_mcp import tunnel as tunnel_mod
+
+    def fake_popen(*a, **k):
+        proc = _LifecycleProc()
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(tunnel_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tunnel_mod, "_port_open", lambda port: True)
+    t = tunnel_mod.SshLocalForwardTunnel("user@remote", "localhost", 9222, local_port=6555)
+    t.start()
+    return t
+
+
+def test_ensure_alive_leaves_a_live_tunnel_alone(monkeypatch):
+    spawned = []
+    t = _started_tunnel(monkeypatch, spawned)
+    t.ensure_alive()
+    assert len(spawned) == 1  # no respawn
+    assert t._proc is spawned[0]
+
+
+def test_ensure_alive_restarts_a_dead_tunnel_on_the_same_port(monkeypatch, capsys):
+    spawned = []
+    t = _started_tunnel(monkeypatch, spawned)
+    spawned[0].returncode = 255  # ssh died (network drop, kill, ...)
+    t.ensure_alive()
+    assert len(spawned) == 2
+    assert t._proc is spawned[1]
+    assert t.local_url == "http://127.0.0.1:6555"  # CDP_URL stays valid
+    assert "exited (code 255)" in capsys.readouterr().err
+
+
+def test_ensure_alive_propagates_a_failed_restart(monkeypatch):
+    from chrome_remote_debugging_mcp import tunnel as tunnel_mod
+
+    spawned = []
+    t = _started_tunnel(monkeypatch, spawned)
+    spawned[0].returncode = 255
+
+    class RefusedProc(_LifecycleProc):
+        def __init__(self):
+            super().__init__(returncode=255)
+            self.stderr = io.StringIO("Connection refused\n")
+
+    monkeypatch.setattr(tunnel_mod.subprocess, "Popen", lambda *a, **k: RefusedProc())
+    with pytest.raises(RuntimeError, match="Connection refused"):
+        t.ensure_alive()
+
+
+def test_ensure_alive_does_not_resurrect_a_stopped_tunnel(monkeypatch):
+    spawned = []
+    t = _started_tunnel(monkeypatch, spawned)
+    t.stop()
+    t.ensure_alive()
+    assert len(spawned) == 1
+    assert t._proc is None
+
+
+def test_restart_registers_atexit_only_once(monkeypatch):
+    from chrome_remote_debugging_mcp import tunnel as tunnel_mod
+
+    registered = []
+    monkeypatch.setattr(tunnel_mod.atexit, "register", registered.append)
+    spawned = []
+    t = _started_tunnel(monkeypatch, spawned)
+    spawned[0].returncode = 255
+    t.ensure_alive()
+    assert registered == [t.stop]

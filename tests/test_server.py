@@ -505,3 +505,77 @@ def test_close_tab_reports_a_close_failure(monkeypatch):
     monkeypatch.setattr(server.cdp, "close_target", fake_close_target)
     out = asyncio.run(_fn(server.close_tab)("T1"))
     assert out["error"] == "cannot close tab T1: boom"
+
+
+# --- lazy tunnel restart before any CDP traffic -----------------------------
+
+class _TunnelSpy:
+    def __init__(self, events, exc=None):
+        self.events = events
+        self.exc = exc
+
+    def ensure_alive(self):
+        self.events.append("ensure_alive")
+        if self.exc is not None:
+            raise self.exc
+
+
+def test_list_tabs_revives_tunnel_before_talking_to_chrome(monkeypatch):
+    events = []
+
+    async def fake_list_targets(url):
+        events.append("list_targets")
+        return [PAGE]
+
+    monkeypatch.setattr(server.cdp, "list_targets", fake_list_targets)
+    monkeypatch.setattr(server, "_TUNNEL", _TunnelSpy(events))
+    out = asyncio.run(_fn(server.list_tabs)())
+    assert events == ["ensure_alive", "list_targets"]
+    assert out["tabs"][0]["id"] == "T1"
+
+
+def test_list_tabs_reports_a_tunnel_that_cannot_be_revived(monkeypatch):
+    _stub(monkeypatch, targets=[PAGE])
+    monkeypatch.setattr(server, "_TUNNEL", _TunnelSpy([], RuntimeError("ssh tunnel to u@h exited early")))
+    out = asyncio.run(_fn(server.list_tabs)())
+    assert "ssh tunnel to u@h exited early" in out["error"]
+
+
+def test_new_tab_revives_tunnel_first(monkeypatch):
+    events = []
+    _stub(monkeypatch, targets=[PAGE], send_result={"frameId": "F"})
+    monkeypatch.setattr(server, "_TUNNEL", _TunnelSpy(events, RuntimeError("tunnel down")))
+    out = asyncio.run(_fn(server.navigate)("http://a/"))
+    assert events == ["ensure_alive"]
+    assert "tunnel down" in out["error"]
+
+
+def test_ping_reports_a_tunnel_that_cannot_be_revived(monkeypatch):
+    async def fake_version(url):
+        raise AssertionError("must not reach Chrome through a dead tunnel")
+
+    monkeypatch.setattr(server.cdp, "get_version", fake_version)
+    monkeypatch.setattr(server, "_TUNNEL", _TunnelSpy([], RuntimeError("tunnel down")))
+    out = asyncio.run(_fn(server.ping)())
+    assert out["connected"] is False
+    assert "tunnel down" in out["error"]
+
+
+def test_main_exposes_tunnel_while_serving(monkeypatch):
+    seen = []
+
+    class FakeTunnel:
+        local_url = "http://127.0.0.1:5999"
+        def __init__(self, *a): pass
+        def start(self): pass
+        def stop(self): pass
+
+    monkeypatch.setattr(server, "SSH_PROXY_TO", "user@remote")
+    monkeypatch.setattr(server, "SSH_PROXY_PORT", None)
+    monkeypatch.setattr(server, "CDP_URL", "http://remotehost:9222")
+    monkeypatch.setattr(server, "_TUNNEL", None)
+    monkeypatch.setattr(server, "SshLocalForwardTunnel", FakeTunnel)
+    monkeypatch.setattr(server.mcp, "run", lambda: seen.append(server._TUNNEL))
+    server.main()
+    assert isinstance(seen[0], FakeTunnel)
+    assert server._TUNNEL is None  # cleared once the tunnel is stopped
