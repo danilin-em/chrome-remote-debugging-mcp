@@ -9,8 +9,12 @@ It connects to Chrome's remote-debugging endpoint and exposes browser control as
 - A Chrome/Chromium started with remote debugging:
 
   ```bash
-  google-chrome --remote-debugging-port=9222
+  google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.config/chrome-remote-debugging-mcp"
   ```
+
+  `--user-data-dir` is required: since Chrome 136 the debugging port is not
+  opened for the default profile. The separate profile starts logged out of
+  every site; keep it at a persistent path so logins survive restarts.
 
 ## Register with an MCP client
 

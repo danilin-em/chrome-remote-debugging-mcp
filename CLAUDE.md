@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-An MCP server (stdio transport, built on `FastMCP`) that controls an *already-running* Chrome over the Chrome DevTools Protocol (CDP). It does **not** launch Chrome — a browser must already be listening on the remote-debugging endpoint (`google-chrome --remote-debugging-port=9222`). Currently a skeleton meant to be extended with more tools.
+An MCP server (stdio transport, built on `FastMCP`) that controls an *already-running* Chrome over the Chrome DevTools Protocol (CDP). It does **not** launch Chrome — a browser must already be listening on the remote-debugging endpoint (`google-chrome --remote-debugging-port=9222 --user-data-dir=<dir>` — since Chrome 136 the port is not opened for the default profile, so a non-default `--user-data-dir` is mandatory). Currently a skeleton meant to be extended with more tools.
 
 ## Commands
 
