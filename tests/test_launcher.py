@@ -84,6 +84,23 @@ def test_port_alive_true_when_an_http_endpoint_answers():
         srv.server_close()
 
 
+class _SlowVersionHandler(_VersionHandler):
+    def do_GET(self):
+        time.sleep(1.0)  # a busy browser UI thread (session restore, swap)
+        super().do_GET()
+
+
+def test_port_alive_waits_for_a_slow_but_live_endpoint():
+    # A Chrome that answers late is alive: misreading it as dead makes
+    # ensure_alive kill it (when owned) or unlink the shared port file.
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _SlowVersionHandler)
+    threading.Thread(target=srv.handle_request, daemon=True).start()
+    try:
+        assert launcher._port_alive(srv.server_address[1]) is True
+    finally:
+        srv.server_close()
+
+
 def test_port_alive_false_when_nothing_listens():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -245,6 +262,27 @@ def test_ensure_alive_times_out_kills_chrome_and_explains(monkeypatch, tmp_path)
     assert "--remote-debugging-port" in msg
     assert not (tmp_path / "DevToolsActivePort").exists()  # stale file removed
     assert spawns[0][2].calls == ["terminate"]
+    assert chrome.owned is False
+
+
+def test_ensure_alive_fails_fast_when_chrome_exits_without_a_port(monkeypatch, tmp_path):
+    # e.g. no display, or a sandboxed (snap) Chromium that cannot start:
+    # our process is gone and no port will ever appear.
+    live = _live_ports(monkeypatch)
+    spawns = _fake_chrome(monkeypatch, live, write=False, alive=False)
+    ticks = itertools.count(0, 0.1)
+    monkeypatch.setattr(
+        launcher, "time", SimpleNamespace(monotonic=lambda: next(ticks), sleep=lambda s: None)
+    )
+    chrome = launcher.ChromeLauncher(tmp_path, startup_timeout=15)
+
+    with pytest.raises(RuntimeError) as exc:
+        chrome.ensure_alive()
+    msg = str(exc.value)
+    assert "exited with code 0" in msg
+    assert str(tmp_path) in msg
+    assert next(ticks) < 5  # gave up after a short grace, not the 15 s timeout
+    assert spawns[0][2].calls == []
     assert chrome.owned is False
 
 

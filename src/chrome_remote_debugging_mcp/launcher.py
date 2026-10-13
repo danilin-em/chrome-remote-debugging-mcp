@@ -31,6 +31,14 @@ DEFAULT_PROFILE_DIR = pathlib.Path.home() / ".cache" / "chrome-remote-debugging-
 STARTUP_TIMEOUT = 15.0
 _ACTIVE_PORT_FILE = "DevToolsActivePort"
 _POLL_INTERVAL = 0.1
+# A live Chrome serves /json/version on its UI thread, which can stall for a
+# second or more (session restore, swap). Reading that as "dead" would kill a
+# Chrome we own or unlink the port file of one we share. A dead port refuses
+# the connection at once, so the generous timeout costs nothing there.
+_PROBE_TIMEOUT = 3.0
+# How long to keep watching for a port after our Chrome process has exited.
+# Covers a hand-off to a Chrome that is itself still starting on the profile.
+_EXIT_GRACE = 2.0
 
 
 def _log(msg: str) -> None:
@@ -74,7 +82,7 @@ def read_active_port(profile_dir: pathlib.Path) -> int | None:
 def _port_alive(port: int) -> bool:
     """True when a DevTools HTTP endpoint answers on ``127.0.0.1:port``."""
     try:
-        with urllib.request.urlopen(f"{_url(port)}/json/version", timeout=0.5):
+        with urllib.request.urlopen(f"{_url(port)}/json/version", timeout=_PROBE_TIMEOUT):
             return True
     except Exception:  # refused, reset, timeout, HTTP error: not a live endpoint
         return False
@@ -149,8 +157,20 @@ class ChromeLauncher:
                     self._proc = None
                 _log(f"Chrome ready on {_url(port)} ({'launched' if self.owned else 'attached'})")
                 return _url(port)
+            if proc.poll() is not None:
+                # No port and no process: Chrome could not start here (e.g. no
+                # display) or handed off to a Chrome without a debugging port.
+                deadline = min(deadline, time.monotonic() + _EXIT_GRACE)
             time.sleep(_POLL_INTERVAL)
+        code = proc.poll()
         self.stop()
+        if code is not None:
+            raise RuntimeError(
+                f"Chrome exited with code {code} without opening a debugging port "
+                f"(profile {self.profile_dir}); either the profile is in use by a "
+                "Chrome started without --remote-debugging-port, or Chrome cannot "
+                "start here (e.g. no display)"
+            )
         raise RuntimeError(
             f"Chrome did not open its debugging port within {self._startup_timeout:.0f}s "
             f"(profile {self.profile_dir}); the profile may be in use by a Chrome "
