@@ -579,3 +579,131 @@ def test_main_exposes_tunnel_while_serving(monkeypatch):
     server.main()
     assert isinstance(seen[0], FakeTunnel)
     assert server._TUNNEL is None  # cleared once the tunnel is stopped
+
+
+# --- CHROME_LAUNCH: lazy local Chrome ----------------------------------------
+
+@pytest.mark.parametrize("raw, expected", [
+    ("1", True), ("true", True), ("YES", True), (" on ", True),
+    ("0", False), ("false", False), ("", False), (None, False),
+])
+def test_env_flag(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("CHROME_LAUNCH", raising=False)
+    else:
+        monkeypatch.setenv("CHROME_LAUNCH", raw)
+    assert server._env_flag("CHROME_LAUNCH") is expected
+
+
+class _LauncherSpy:
+    def __init__(self, url="http://127.0.0.1:41234", exc=None):
+        self.url, self.exc, self.calls = url, exc, 0
+
+    def ensure_alive(self):
+        self.calls += 1
+        if self.exc is not None:
+            raise self.exc
+        return self.url
+
+
+def test_ping_launches_chrome_and_reports_its_url(monkeypatch):
+    seen = []
+
+    async def fake_version(url):
+        seen.append(url)
+        return {"Browser": "Chrome/141.0", "Protocol-Version": "1.3"}
+
+    monkeypatch.setattr(server.cdp, "get_version", fake_version)
+    monkeypatch.setattr(server, "CDP_URL", "http://localhost:9222")
+    monkeypatch.setattr(server, "_LAUNCHER", _LauncherSpy())
+    out = asyncio.run(_fn(server.ping)())
+    assert seen == ["http://127.0.0.1:41234"]
+    assert out["connected"] is True
+    assert out["cdp_url"] == "http://127.0.0.1:41234"
+
+
+def test_ensure_chrome_follows_a_relaunch_to_a_new_port(monkeypatch):
+    spy = _LauncherSpy()
+    monkeypatch.setattr(server, "CDP_URL", "http://localhost:9222")
+    monkeypatch.setattr(server, "_LAUNCHER", spy)
+    asyncio.run(server._ensure_chrome())
+    spy.url = "http://127.0.0.1:41999"  # Chrome was closed and relaunched
+    asyncio.run(server._ensure_chrome())
+    assert server.CDP_URL == "http://127.0.0.1:41999"
+    assert spy.calls == 2
+
+
+def test_ensure_chrome_without_a_launcher_is_a_noop(monkeypatch):
+    monkeypatch.setattr(server, "CDP_URL", "http://localhost:9222")
+    monkeypatch.setattr(server, "_LAUNCHER", None)
+    asyncio.run(server._ensure_chrome())
+    assert server.CDP_URL == "http://localhost:9222"
+
+
+def test_list_tabs_reports_a_chrome_that_cannot_be_launched(monkeypatch):
+    _stub(monkeypatch, targets=[PAGE])
+    monkeypatch.setattr(server, "_LAUNCHER", _LauncherSpy(exc=RuntimeError("Chrome not found in PATH (tried: google-chrome)")))
+    out = asyncio.run(_fn(server.list_tabs)())
+    assert "Chrome not found in PATH" in out["error"]
+
+
+def test_new_tab_reports_a_chrome_that_cannot_be_launched(monkeypatch):
+    _stub(monkeypatch, targets=[PAGE], send_result={"frameId": "F"})
+    monkeypatch.setattr(server, "_LAUNCHER", _LauncherSpy(exc=RuntimeError("Chrome did not open its debugging port within 15s")))
+    out = asyncio.run(_fn(server.navigate)("http://a/"))
+    assert "did not open its debugging port" in out["error"]
+
+
+def test_ping_reports_a_chrome_that_cannot_be_launched(monkeypatch):
+    async def fake_version(url):
+        raise AssertionError("must not talk to Chrome when the launch failed")
+
+    monkeypatch.setattr(server.cdp, "get_version", fake_version)
+    monkeypatch.setattr(server, "_LAUNCHER", _LauncherSpy(exc=RuntimeError("Chrome not found in PATH")))
+    out = asyncio.run(_fn(server.ping)())
+    assert out["connected"] is False
+    assert "Chrome not found in PATH" in out["error"]
+
+
+@pytest.mark.parametrize("cdp_url_set, ssh", [(True, None), (False, "user@remote")])
+def test_main_refuses_chrome_launch_with_cdp_url_or_ssh(monkeypatch, cdp_url_set, ssh):
+    monkeypatch.setattr(server, "CHROME_LAUNCH", True)
+    monkeypatch.setattr(server, "_CDP_URL_SET", cdp_url_set)
+    monkeypatch.setattr(server, "SSH_PROXY_TO", ssh)
+    monkeypatch.setattr(server.mcp, "run", lambda: pytest.fail("must not serve a conflicting config"))
+    with pytest.raises(SystemExit, match="CHROME_LAUNCH cannot be combined with CDP_URL or SSH_PROXY_TO"):
+        server.main()
+
+
+def test_main_with_chrome_launch_creates_the_launcher_lazily_and_stops_it(monkeypatch):
+    events = []
+
+    class FakeLauncher:
+        def __init__(self):
+            events.append("init")
+
+        def ensure_alive(self):
+            raise AssertionError("main() must not launch Chrome — the launch is lazy")
+
+        def stop(self):
+            events.append("stop")
+
+    monkeypatch.setattr(server, "CHROME_LAUNCH", True)
+    monkeypatch.setattr(server, "_CDP_URL_SET", False)
+    monkeypatch.setattr(server, "SSH_PROXY_TO", None)
+    monkeypatch.setattr(server, "_LAUNCHER", None)
+    monkeypatch.setattr(server, "ChromeLauncher", FakeLauncher)
+    monkeypatch.setattr(server.mcp, "run", lambda: events.append(("run", type(server._LAUNCHER).__name__)))
+    server.main()
+    assert events == ["init", ("run", "FakeLauncher"), "stop"]
+    assert server._LAUNCHER is None  # cleared once Chrome is stopped
+
+
+def test_main_without_chrome_launch_has_no_launcher(monkeypatch):
+    seen = []
+    monkeypatch.setattr(server, "CHROME_LAUNCH", False)
+    monkeypatch.setattr(server, "SSH_PROXY_TO", None)
+    monkeypatch.setattr(server, "_LAUNCHER", None)
+    monkeypatch.setattr(server.mcp, "run", lambda: seen.append(server._LAUNCHER))
+    server.main()
+    assert seen == [None]

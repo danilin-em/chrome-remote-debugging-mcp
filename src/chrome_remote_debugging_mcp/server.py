@@ -2,7 +2,9 @@
 
 Run over stdio (the default transport) as a console script or via
 ``python -m chrome_remote_debugging_mcp``. The Chrome endpoint is read from the
-``CDP_URL`` environment variable (default ``http://localhost:9222``).
+``CDP_URL`` environment variable (default ``http://localhost:9222``); with
+``CHROME_LAUNCH`` set, the server starts a local Chrome itself instead (see
+``launcher.py``).
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from mcp.server.fastmcp import FastMCP
 from . import actions, cdp
 from . import browse as browse_engine
 from .tunnel import SshLocalForwardTunnel
+from .launcher import ChromeLauncher
 
 
 def _env_int(name: str) -> int | None:
@@ -24,6 +27,11 @@ def _env_int(name: str) -> int | None:
     if raw is None or not raw.strip():
         return None
     return int(raw)
+
+
+def _env_flag(name: str) -> bool:
+    """True when the env var is ``1``/``true``/``yes``/``on`` (any case)."""
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _split_endpoint(url: str) -> tuple[str, int]:
@@ -42,6 +50,13 @@ SSH_PROXY_TO = os.environ.get("SSH_PROXY_TO") or None
 SSH_PROXY_PORT = _env_int("SSH_PROXY_PORT")
 # The live tunnel while main() is serving, else None.
 _TUNNEL: SshLocalForwardTunnel | None = None
+# CHROME_LAUNCH: start (or attach to) a local Chrome lazily instead of
+# connecting to CDP_URL. Mutually exclusive with CDP_URL and SSH_PROXY_TO —
+# "set" means present in the environment, not "differs from the default".
+CHROME_LAUNCH = _env_flag("CHROME_LAUNCH")
+_CDP_URL_SET = "CDP_URL" in os.environ
+# The launcher while main() is serving with CHROME_LAUNCH, else None.
+_LAUNCHER: ChromeLauncher | None = None
 
 mcp = FastMCP("chrome-remote-debugging-mcp")
 
@@ -61,9 +76,24 @@ async def _ensure_tunnel() -> None:
         await asyncio.to_thread(_TUNNEL.ensure_alive)
 
 
+async def _ensure_chrome() -> None:
+    """Make sure the auto-launched Chrome is up; no-op without CHROME_LAUNCH.
+
+    Rewrites ``CDP_URL`` on every call: a relaunch (the user closed the
+    window) lands on a new port, and tools read ``CDP_URL`` at call time.
+    Runs in a worker thread because a launch blocks for up to the startup
+    timeout. Raises ``RuntimeError`` on failure; callers already turn any
+    exception here into an ``{"error": ...}`` payload.
+    """
+    global CDP_URL
+    if _LAUNCHER is not None:
+        CDP_URL = await asyncio.to_thread(_LAUNCHER.ensure_alive)
+
+
 async def _page_targets() -> list[dict]:
     """Return only the ``page`` targets from Chrome (i.e. real tabs)."""
     await _ensure_tunnel()
+    await _ensure_chrome()
     targets = await cdp.list_targets(CDP_URL)
     return [t for t in targets if t.get("type") == "page"]
 
@@ -89,6 +119,7 @@ async def _open_target() -> tuple[dict, str]:
     """Open a new blank tab and return ``(target, ws_url)``."""
     try:
         await _ensure_tunnel()
+        await _ensure_chrome()
         target = await cdp.new_target(CDP_URL)
     except Exception as exc:
         raise _TargetError(f"cannot open a new tab at {CDP_URL}: {exc}")
@@ -119,6 +150,7 @@ async def ping() -> dict:
     """
     try:
         await _ensure_tunnel()
+        await _ensure_chrome()
         info = await cdp.get_version(CDP_URL)
     except Exception as exc:
         return {"connected": False, "cdp_url": CDP_URL, "error": str(exc)}
@@ -371,8 +403,18 @@ def main() -> None:
     (which reads ``CDP_URL`` at call time) transparently egresses through the
     remote host. The tunnel lives exactly as long as the server; if ssh dies
     in between, the next tool call respawns it on the same port.
+
+    When ``CHROME_LAUNCH`` is set, create a :class:`ChromeLauncher` but do not
+    launch yet: the first tool call that needs Chrome starts it (or attaches
+    to the one already serving the profile). Chrome is closed on exit only if
+    this server launched it.
     """
-    global CDP_URL, _TUNNEL
+    global CDP_URL, _TUNNEL, _LAUNCHER
+    if CHROME_LAUNCH and (_CDP_URL_SET or SSH_PROXY_TO):
+        raise SystemExit(
+            "CHROME_LAUNCH cannot be combined with CDP_URL or SSH_PROXY_TO: "
+            "either launch a local Chrome or connect to an existing one"
+        )
     tunnel: SshLocalForwardTunnel | None = None
     if SSH_PROXY_TO:
         host, port = _split_endpoint(CDP_URL)
@@ -380,12 +422,19 @@ def main() -> None:
         tunnel.start()
         CDP_URL = tunnel.local_url
         _TUNNEL = tunnel
+    launcher: ChromeLauncher | None = None
+    if CHROME_LAUNCH:
+        launcher = ChromeLauncher()
+        _LAUNCHER = launcher
     try:
         mcp.run()
     finally:
         if tunnel is not None:
             _TUNNEL = None
             tunnel.stop()
+        if launcher is not None:
+            _LAUNCHER = None
+            launcher.stop()
 
 
 if __name__ == "__main__":

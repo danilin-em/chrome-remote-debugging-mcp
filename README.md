@@ -16,6 +16,9 @@ It connects to Chrome's remote-debugging endpoint and exposes browser control as
   opened for the default profile. The separate profile starts logged out of
   every site; keep it at a persistent path so logins survive restarts.
 
+  Alternatively, set `CHROME_LAUNCH=1` and let the server start Chrome itself —
+  see [Auto-launch Chrome](#auto-launch-chrome-optional).
+
 ## Register with an MCP client
 
 Example `mcpServers` entry:
@@ -154,7 +157,33 @@ For a page whose content arrives after load — most single-page applications �
 | Env var   | Default                   | Meaning                        |
 |-----------|---------------------------|--------------------------------|
 | `CDP_URL` | `http://localhost:9222`   | Chrome remote-debugging origin |
+| `CHROME_LAUNCH` | unset (off)       | `1`/`true`/`yes`/`on` → start a local Chrome on first use instead of connecting to `CDP_URL`. Cannot be combined with `CDP_URL` or `SSH_PROXY_TO`. |
 | `MCP_DEBUG_LOG` | unset (off)         | Log every tool call — arguments, result, duration — to a file. `1`/`true`/`yes`/`on` → `/tmp/chrome-remote-debugging-mcp.log`; any other value is the log file path; `0`/`false`/`no`/`off` or empty → off. Read once at startup. |
+
+## Auto-launch Chrome (optional)
+
+```json
+{
+  "mcpServers": {
+    "chrome-remote-debugging": {
+      "command": "uvx",
+      "args": ["chrome-remote-debugging-mcp"],
+      "env": { "CHROME_LAUNCH": "1" }
+    }
+  }
+}
+```
+
+The first tool call starts Chrome (`google-chrome`, `google-chrome-stable`,
+`chromium` or `chromium-browser`, whichever is first on `PATH`) with its own
+persistent profile at `~/.cache/chrome-remote-debugging-mcp/chrome-profile`
+and a debugging port Chrome picks itself. Log in to sites once in that window;
+the logins survive restarts. If Chrome is closed, the next tool call starts it
+again. Several MCP sessions share the same Chrome; it is closed when the
+session that started it exits.
+
+Do not set `CDP_URL` or `SSH_PROXY_TO` together with `CHROME_LAUNCH` — the
+server refuses to start.
 
 ## SSH tunnel (optional)
 
