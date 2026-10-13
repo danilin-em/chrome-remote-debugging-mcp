@@ -17,15 +17,20 @@ and must never be polluted — which is also why Chrome's own output goes to
 
 from __future__ import annotations
 
+import contextlib
 import pathlib
 import shutil
+import subprocess
 import sys
+import threading
+import time
 import urllib.request
 
 CHROME_CANDIDATES = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser")
 DEFAULT_PROFILE_DIR = pathlib.Path.home() / ".cache" / "chrome-remote-debugging-mcp" / "chrome-profile"
 STARTUP_TIMEOUT = 15.0
 _ACTIVE_PORT_FILE = "DevToolsActivePort"
+_POLL_INTERVAL = 0.1
 
 
 def _log(msg: str) -> None:
@@ -73,3 +78,95 @@ def _port_alive(port: int) -> bool:
             return True
     except Exception:  # refused, reset, timeout, HTTP error: not a live endpoint
         return False
+
+
+class ChromeLauncher:
+    """Starts — or attaches to — the Chrome serving ``profile_dir``, on demand.
+
+    ``ensure_alive()`` is the single entry point; it costs one HTTP probe when
+    Chrome is already up. ``stop()`` closes Chrome only if this instance
+    launched it (``owned``); an attached Chrome belongs to someone else.
+    """
+
+    def __init__(
+        self,
+        profile_dir: pathlib.Path = DEFAULT_PROFILE_DIR,
+        *,
+        startup_timeout: float = STARTUP_TIMEOUT,
+    ) -> None:
+        self.profile_dir = profile_dir
+        self._startup_timeout = startup_timeout
+        # Our Chrome child — set only while we own the Chrome serving the
+        # profile. None when attached to another instance's Chrome or idle.
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._port: int | None = None
+        # Serialises ensure_alive(): concurrent tool calls run it in worker
+        # threads, and two of them must not both launch Chrome.
+        self._lock = threading.Lock()
+
+    @property
+    def owned(self) -> bool:
+        return self._proc is not None
+
+    def ensure_alive(self) -> str:
+        """Return a live ``http://127.0.0.1:<port>``, attaching or launching as needed.
+
+        Raises ``RuntimeError`` when no Chrome binary is found or Chrome does
+        not open its debugging port within ``startup_timeout``.
+        """
+        with self._lock:
+            if self._port is not None and _port_alive(self._port):
+                return _url(self._port)
+            self.stop()  # release whatever we held: a closed or hung Chrome
+            port = read_active_port(self.profile_dir)
+            if port is not None and _port_alive(port):
+                _log(f"attaching to the Chrome already serving {self.profile_dir} on port {port}")
+                self._port = port
+                return _url(port)
+            return self._launch()
+
+    def _launch(self) -> str:
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        # A file left by a crashed Chrome would point us at a dead port.
+        (self.profile_dir / _ACTIVE_PORT_FILE).unlink(missing_ok=True)
+        cmd = build_command(find_chrome(), self.profile_dir)
+        _log(f"starting: {' '.join(cmd)}")
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._proc = proc
+        deadline = time.monotonic() + self._startup_timeout
+        while time.monotonic() < deadline:
+            port = read_active_port(self.profile_dir)
+            if port is not None and _port_alive(port):
+                self._port = port
+                if proc.poll() is not None:
+                    # Our process found the profile held by a running Chrome,
+                    # handed off to it and exited: we are attached, not owner.
+                    self._proc = None
+                _log(f"Chrome ready on {_url(port)} ({'launched' if self.owned else 'attached'})")
+                return _url(port)
+            time.sleep(_POLL_INTERVAL)
+        self.stop()
+        raise RuntimeError(
+            f"Chrome did not open its debugging port within {self._startup_timeout:.0f}s "
+            f"(profile {self.profile_dir}); the profile may be in use by a Chrome "
+            "started without --remote-debugging-port"
+        )
+
+    def stop(self) -> None:
+        """Close Chrome if we launched it; forget the port either way (idempotent)."""
+        proc, self._proc, self._port = self._proc, None, None
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+        if proc.poll() is None:
+            proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
+        _log("stopped")
