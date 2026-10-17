@@ -140,6 +140,12 @@ def test_remote_command_quotes_dir_but_expands_tilde(ssh):
     assert ssh["kw"]["stdin"] == subprocess.DEVNULL  # never the MCP stdio channel
 
 
+def test_remote_command_expands_a_bare_tilde(ssh):
+    ac = AutoConnect("u@h", "~", None)
+    asyncio.run(ac.ws_url())
+    assert ssh["argv"][-1] == "cat -- ~/DevToolsActivePort"
+
+
 def test_remote_command_absolute_dir_is_quoted(ssh):
     ac = AutoConnect("u@h", "/opt/my chrome", None)
     asyncio.run(ac.ws_url())

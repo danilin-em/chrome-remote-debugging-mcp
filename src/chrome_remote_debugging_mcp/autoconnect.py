@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import posixpath
 import shlex
 import subprocess
 
@@ -123,8 +124,8 @@ class AutoConnect:
     def _read_remote(self) -> str:
         d = self.user_data_dir
         # `~` must be expanded by the remote shell, so it stays outside the quotes.
-        if d.startswith("~/"):
-            remote_path = "~/" + shlex.quote(d[2:] + "/" + _FILE)
+        if d == "~" or d.startswith("~/"):
+            remote_path = "~/" + shlex.quote(posixpath.join(d[2:], _FILE))
         else:
             remote_path = shlex.quote(d + "/" + _FILE)
         try:
