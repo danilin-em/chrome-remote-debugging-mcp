@@ -24,79 +24,6 @@ def _mock_http(monkeypatch, handler):
     )
 
 
-class FakeWS:
-    """In-memory stand-in for a websockets connection.
-
-    Records sent frames and replays a queued list of server messages, so tests
-    can exercise :func:`cdp.send` without a real WebSocket.
-    """
-
-    def __init__(self, messages):
-        self._messages = list(messages)
-        self.sent = []
-
-    async def send(self, data):
-        self.sent.append(data)
-
-    async def recv(self):
-        return json.dumps(self._messages.pop(0))
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-def _patch(monkeypatch, fake):
-    # Deterministic ids so queued responses can target a known command id.
-    monkeypatch.setattr(cdp, "_ids", itertools.count(1))
-    monkeypatch.setattr(cdp.websockets, "connect", lambda *a, **k: fake)
-
-
-def test_send_returns_result_and_skips_events(monkeypatch):
-    fake = FakeWS(
-        [
-            {"method": "Page.loadEventFired", "params": {}},  # event, no id → skipped
-            {"id": 1, "result": {"frameId": "F1"}},
-        ]
-    )
-    _patch(monkeypatch, fake)
-
-    result = asyncio.run(cdp.send("ws://x", "Page.navigate", {"url": "https://e"}))
-
-    assert result == {"frameId": "F1"}
-    sent = json.loads(fake.sent[0])
-    assert sent["method"] == "Page.navigate"
-    assert sent["params"] == {"url": "https://e"}
-    assert sent["id"] == 1
-
-
-def test_send_raises_cdperror(monkeypatch):
-    fake = FakeWS([{"id": 1, "error": {"message": "boom"}}])
-    _patch(monkeypatch, fake)
-
-    with pytest.raises(cdp.CDPError, match="boom"):
-        asyncio.run(cdp.send("ws://x", "Bad.method"))
-
-
-def test_send_error_without_message_stringifies_error(monkeypatch):
-    # error dict lacks "message" → falls back to str(error).
-    fake = FakeWS([{"id": 1, "error": {"code": -32000}}])
-    _patch(monkeypatch, fake)
-
-    with pytest.raises(cdp.CDPError, match="-32000"):
-        asyncio.run(cdp.send("ws://x", "Bad.method"))
-
-
-def test_send_defaults_result_to_empty_dict(monkeypatch):
-    # A response with no "result" key returns {} rather than None.
-    fake = FakeWS([{"id": 1}])
-    _patch(monkeypatch, fake)
-
-    assert asyncio.run(cdp.send("ws://x", "Some.method")) == {}
-
-
 def test_list_targets_hits_json_list_and_parses(monkeypatch):
     seen = {}
 
@@ -175,39 +102,6 @@ def test_close_target_raises_on_http_error(monkeypatch):
 
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(cdp.close_target("http://localhost:9222", "ZZ"))
-
-
-class HangingWS(FakeWS):
-    """A socket that accepts the command but never answers — a stalled tunnel."""
-
-    async def recv(self):
-        await asyncio.Event().wait()
-
-
-def test_send_times_out_when_no_response_arrives(monkeypatch):
-    _patch(monkeypatch, HangingWS([]))
-    with pytest.raises(cdp.CDPTimeout, match=r"no response to DOM\.getDocument within 0\.01s"):
-        asyncio.run(cdp.send("ws://x", "DOM.getDocument", timeout=0.01))
-
-
-def test_send_uses_module_default_timeout(monkeypatch):
-    _patch(monkeypatch, HangingWS([]))
-    monkeypatch.setattr(cdp, "SEND_TIMEOUT", 0.01)
-    with pytest.raises(cdp.CDPTimeout):
-        asyncio.run(cdp.send("ws://x", "Page.navigate"))
-
-
-def test_send_times_out_despite_a_stream_of_unrelated_events(monkeypatch):
-    # The deadline covers the whole exchange, not each recv(): events that
-    # keep arriving must not keep the call alive forever.
-    class ChattyWS(FakeWS):
-        async def recv(self):
-            await asyncio.sleep(0.001)
-            return json.dumps({"method": "Network.dataReceived", "params": {}})
-
-    _patch(monkeypatch, ChattyWS([]))
-    with pytest.raises(cdp.CDPTimeout):
-        asyncio.run(cdp.send("ws://x", "Page.navigate", timeout=0.05))
 
 
 def test_timeout_is_not_a_cdp_error():
@@ -600,3 +494,257 @@ def test_exception_hierarchy():
     assert not issubclass(cdp.CDPDisconnected, cdp.CDPError)
     assert not issubclass(cdp.TargetDetached, cdp.CDPError)
     assert issubclass(cdp.CDPDisconnected, ConnectionError)
+
+
+# --- Sessions: one flattened session per tab, and send(page, ...) ----------
+
+def _tabs(frame):
+    """Answer an attach with ``S-<targetId>`` and anything else with an echo."""
+    if frame["method"] == "Target.attachToTarget":
+        session_id = f"S-{frame['params']['targetId']}"
+        return [{"id": frame["id"], "result": {"sessionId": session_id}}]
+    return [{"id": frame["id"], "result": {"echo": frame["method"]}}]
+
+
+def _attaches(fake):
+    return [f for f in fake.sent if f["method"] == "Target.attachToTarget"]
+
+
+def _holding(method):
+    """Like :func:`_tabs`, but never answer ``method``."""
+    return lambda frame: [] if frame["method"] == method else _tabs(frame)
+
+
+def test_send_attaches_once_and_reuses_session(monkeypatch):
+    fake = FakeBrowserWS(_tabs)
+    _patch_connect(monkeypatch, fake)
+    page = cdp.Page(cdp.Browser(_provider("ws://x")), "T1")
+
+    async def scenario():
+        return [await cdp.send(page, "Runtime.evaluate", {"expression": "1"}),
+                await cdp.send(page, "Runtime.evaluate")]
+
+    assert asyncio.run(scenario()) == [{"echo": "Runtime.evaluate"}] * 2
+    attaches = _attaches(fake)
+    assert attaches == [{"id": 1, "method": "Target.attachToTarget",
+                         "params": {"targetId": "T1", "flatten": True}}]
+    evaluates = [f for f in fake.sent if f["method"] == "Runtime.evaluate"]
+    assert [f["sessionId"] for f in evaluates] == ["S-T1", "S-T1"]
+    assert evaluates[0]["params"] == {"expression": "1"}
+
+
+def test_concurrent_sends_share_one_attach(monkeypatch):
+    fake = FakeBrowserWS(_tabs)
+    _patch_connect(monkeypatch, fake)
+    page = cdp.Page(cdp.Browser(_provider("ws://x")), "T1")
+
+    async def scenario():
+        return await asyncio.gather(*(cdp.send(page, "Runtime.evaluate")
+                                      for _ in range(3)))
+
+    assert asyncio.run(scenario()) == [{"echo": "Runtime.evaluate"}] * 3
+    assert len(_attaches(fake)) == 1
+
+
+def test_cancelled_sender_does_not_cancel_shared_attach(monkeypatch):
+    fake = FakeBrowserWS(_holding("Target.attachToTarget"))
+    _patch_connect(monkeypatch, fake)
+    page = cdp.Page(cdp.Browser(_provider("ws://x")), "T1")
+
+    async def scenario():
+        first = asyncio.ensure_future(cdp.send(page, "A.a"))
+        second = asyncio.ensure_future(cdp.send(page, "B.b"))
+        await _settle()
+        first.cancel()
+        await _settle()
+        attach = _attaches(fake)[0]
+        fake.push({"id": attach["id"], "result": {"sessionId": "S-T1"}})
+        result = await second
+        assert first.cancelled()
+        return result
+
+    assert asyncio.run(scenario()) == {"echo": "B.b"}
+    assert len(_attaches(fake)) == 1
+
+
+def test_attach_error_raises_target_detached(monkeypatch):
+    failed = []
+
+    def handler(frame):
+        if frame["method"] == "Target.attachToTarget" and not failed:
+            failed.append(frame)
+            return [{"id": frame["id"], "error": {
+                "code": -32602, "message": "No target with given id found"}}]
+        return _tabs(frame)
+
+    fake = FakeBrowserWS(handler)
+    _patch_connect(monkeypatch, fake)
+    page = cdp.Page(cdp.Browser(_provider("ws://x")), "T1")
+
+    async def scenario():
+        with pytest.raises(cdp.TargetDetached,
+                           match="tab T1 is gone: No target with given id found") as info:
+            await cdp.send(page, "Runtime.evaluate")
+        assert not isinstance(info.value, cdp.CDPError)
+        return await cdp.send(page, "Runtime.evaluate")
+
+    assert asyncio.run(scenario()) == {"echo": "Runtime.evaluate"}
+    assert len(_attaches(fake)) == 2
+
+
+def test_detach_event_fails_only_that_sessions_pending(monkeypatch):
+    fake = FakeBrowserWS(_holding("Runtime.evaluate"))
+    _patch_connect(monkeypatch, fake)
+    b = cdp.Browser(_provider("ws://x"))
+
+    async def scenario():
+        t1 = asyncio.ensure_future(cdp.send(cdp.Page(b, "T1"), "Runtime.evaluate"))
+        t2 = asyncio.ensure_future(cdp.send(cdp.Page(b, "T2"), "Runtime.evaluate"))
+        await _settle()
+        fake.push({"method": "Target.detachedFromTarget",
+                   "params": {"sessionId": "S-T1", "targetId": "T1"}})
+        with pytest.raises(cdp.TargetDetached) as info:
+            await t1
+        assert not isinstance(info.value, cdp.CDPError)
+        assert not t2.done()
+        [held] = [f for f in fake.sent if f.get("sessionId") == "S-T2"]
+        fake.push({"id": held["id"], "result": {"value": 2}})
+        assert await t2 == {"value": 2}
+        return await cdp.send(cdp.Page(b, "T1"), "Page.reload")
+
+    assert asyncio.run(scenario()) == {"echo": "Page.reload"}
+    assert [f["params"]["targetId"] for f in _attaches(fake)] == ["T1", "T2", "T1"]
+
+
+def test_detach_event_for_unknown_session_is_ignored(monkeypatch):
+    fake = FakeBrowserWS(_tabs)
+    _patch_connect(monkeypatch, fake)
+    page = cdp.Page(cdp.Browser(_provider("ws://x")), "T1")
+
+    async def scenario():
+        await cdp.send(page, "A.a")
+        fake.push({"method": "Target.detachedFromTarget",
+                   "params": {"sessionId": "S-ghost"}})
+        await _settle()
+        return await cdp.send(page, "B.b")
+
+    assert asyncio.run(scenario()) == {"echo": "B.b"}
+    assert len(_attaches(fake)) == 1
+    assert fake.sent[-1]["sessionId"] == "S-T1"
+
+
+def test_session_not_found_error_becomes_target_detached(monkeypatch):
+    def handler(frame):
+        if frame["method"] == "Gone.method":
+            return [{"id": frame["id"], "error": {
+                "code": -32001, "message": "Session with given id not found."}}]
+        return _tabs(frame)
+
+    fake = FakeBrowserWS(handler)
+    _patch_connect(monkeypatch, fake)
+    b = cdp.Browser(_provider("ws://x"))
+    page = cdp.Page(b, "T1")
+
+    async def scenario():
+        with pytest.raises(cdp.TargetDetached,
+                           match="Session with given id not found") as info:
+            await cdp.send(page, "Gone.method")
+        assert not isinstance(info.value, cdp.CDPError)
+        assert await cdp.send(page, "Page.reload") == {"echo": "Page.reload"}
+        with pytest.raises(cdp.CDPError, match="Session with given id not found"):
+            await b.call("Gone.method")
+
+    asyncio.run(scenario())
+    assert len(_attaches(fake)) == 2
+
+
+def test_disconnect_clears_sessions(monkeypatch):
+    first, second = FakeBrowserWS(_tabs), FakeBrowserWS(_tabs)
+    _patch_connect(monkeypatch, first, second)
+    page = cdp.Page(cdp.Browser(_provider("ws://x")), "T1")
+
+    async def scenario():
+        await cdp.send(page, "A.a")
+        first.drop()
+        await _settle()
+        return await cdp.send(page, "B.b")
+
+    assert asyncio.run(scenario()) == {"echo": "B.b"}
+    assert len(_attaches(first)) == 1
+    assert [f["method"] for f in second.sent] == ["Target.attachToTarget", "B.b"]
+    assert second.sent[1]["sessionId"] == "S-T1"
+
+
+def test_attach_answered_as_connection_drops_is_not_cached(monkeypatch):
+    # The attach reply arrives, then the socket dies before the attach
+    # finishes: the session belongs to the dead socket, so it must not land in
+    # the cache the new socket uses.
+    first = FakeBrowserWS(_holding("Target.attachToTarget"))
+    second = FakeBrowserWS(_tabs)
+    _patch_connect(monkeypatch, first, second)
+    page = cdp.Page(cdp.Browser(_provider("ws://x")), "T1")
+
+    async def scenario():
+        pending = asyncio.ensure_future(cdp.send(page, "A.a"))
+        await _settle()
+        first.push({"id": _attaches(first)[0]["id"], "result": {"sessionId": "S-old"}})
+        first.drop()
+        await pending
+        return await cdp.send(page, "B.b")
+
+    assert asyncio.run(scenario()) == {"echo": "B.b"}
+    assert second.sent[-1]["sessionId"] == "S-T1"
+
+
+def test_disconnect_during_attach_lets_next_send_reattach(monkeypatch):
+    first = FakeBrowserWS(_holding("Target.attachToTarget"))
+    second = FakeBrowserWS(_tabs)
+    _patch_connect(monkeypatch, first, second)
+    page = cdp.Page(cdp.Browser(_provider("ws://x")), "T1")
+
+    async def scenario():
+        pending = asyncio.ensure_future(cdp.send(page, "A.a"))
+        await _settle()
+        first.drop()
+        with pytest.raises(cdp.CDPDisconnected):
+            await pending
+        return await cdp.send(page, "B.b")
+
+    assert asyncio.run(scenario()) == {"echo": "B.b"}
+    assert [f["method"] for f in second.sent] == ["Target.attachToTarget", "B.b"]
+
+
+def test_slow_tab_does_not_block_other_tab(monkeypatch):
+    def handler(frame):
+        if frame.get("sessionId") == "S-T1":
+            return []  # T1's page is busy and never answers
+        return _tabs(frame)
+
+    _patch_connect(monkeypatch, FakeBrowserWS(handler))
+    b = cdp.Browser(_provider("ws://x"))
+    finished = []
+
+    async def tracked(name, coro):
+        try:
+            return await coro
+        finally:
+            finished.append(name)
+
+    async def scenario():
+        return await asyncio.gather(
+            tracked("T1", cdp.send(cdp.Page(b, "T1"), "Runtime.evaluate", timeout=0.2)),
+            tracked("T2", cdp.send(cdp.Page(b, "T2"), "Runtime.evaluate")),
+            return_exceptions=True)
+
+    slow, fast = asyncio.run(scenario())
+    assert isinstance(slow, cdp.CDPTimeout)
+    assert fast == {"echo": "Runtime.evaluate"}
+    assert finished == ["T2", "T1"]
+
+
+def test_send_passes_timeout(monkeypatch):
+    _patch_connect(monkeypatch, FakeBrowserWS(_holding("X")))
+    page = cdp.Page(cdp.Browser(_provider("ws://x")), "T1")
+
+    with pytest.raises(cdp.CDPTimeout, match=r"no response to X within 0\.01s"):
+        asyncio.run(cdp.send(page, "X", timeout=0.01))
