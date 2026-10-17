@@ -760,6 +760,25 @@ def test_tools_run_inside_a_call_scope(monkeypatch):
     assert seen and all(seen)
 
 
+async def _probe():
+    pass
+
+
+_SCOPED_CODE = server._scoped(_probe).__code__  # shared by every _scoped wrapper
+_TOOLS = server.mcp._tool_manager.list_tools()
+
+
+@pytest.mark.parametrize("tool", _TOOLS, ids=[t.name for t in _TOOLS])
+def test_every_tool_is_scoped(tool):
+    # One connection per tool call: an unscoped tool could reconnect (and pop
+    # an Allow dialog) mid-call. Walk __wrapped__ past an MCP_DEBUG_LOG wrapper.
+    fn, chain = tool.fn, []
+    while fn is not None:
+        chain.append(fn.__code__)
+        fn = getattr(fn, "__wrapped__", None)
+    assert _SCOPED_CODE in chain
+
+
 def test_scoped_tools_keep_their_schema():
     tools = asyncio.run(server.mcp.list_tools())
     schema = next(t for t in tools if t.name == "navigate").inputSchema
