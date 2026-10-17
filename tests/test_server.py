@@ -19,6 +19,7 @@ def _no_browser(monkeypatch):
     # The real connection is bound to the event loop that opened it, and
     # every test runs its own asyncio.run — never carry one across tests.
     monkeypatch.setattr(server, "_BROWSER", None)
+    monkeypatch.setattr(server, "_AUTOCONNECT", None)
 
 
 class FakeBrowser:
@@ -764,3 +765,95 @@ def test_scoped_tools_keep_their_schema():
     schema = next(t for t in tools if t.name == "navigate").inputSchema
     assert set(schema["properties"]) == {"url", "tab_id"}
     assert schema["required"] == ["url"]
+
+
+# --- CHROME_AUTOCONNECT ---------------------------------------------------
+
+class _FakeAutoConnect:
+    def __init__(self, target=None, directory=None, port=None, events=None):
+        self.args = (target, directory, port)
+        self.events = events if events is not None else []
+        self.wait_message = "click Allow"
+
+    async def ws_url(self):
+        return "ws://127.0.0.1:1/devtools/browser/x"
+
+    async def connect(self, url):
+        raise AssertionError("not used")
+
+    def describe(self):
+        return "autoconnect:~/.config/google-chrome"
+
+    def stop(self):
+        self.events.append("stop")
+
+
+@pytest.mark.parametrize("cdp_url_set, launch", [(True, False), (False, True)])
+def test_main_rejects_autoconnect_with_cdp_url_or_chrome_launch(monkeypatch, cdp_url_set, launch):
+    monkeypatch.setattr(server, "CHROME_AUTOCONNECT", True)
+    monkeypatch.setattr(server, "_CDP_URL_SET", cdp_url_set)
+    monkeypatch.setattr(server, "CHROME_LAUNCH", launch)
+    monkeypatch.setattr(server.mcp, "run", lambda: pytest.fail("must not serve a conflicting config"))
+    with pytest.raises(SystemExit, match="CHROME_AUTOCONNECT cannot be combined with CDP_URL or CHROME_LAUNCH"):
+        server.main()
+
+
+def test_main_autoconnect_over_ssh_does_not_start_a_tunnel(monkeypatch):
+    events, made = [], []
+
+    def make(*args):
+        fake = _FakeAutoConnect(*args, events=events)
+        made.append(fake)
+        return fake
+
+    def boom(*a, **k):
+        raise AssertionError("main() must not start a tunnel in autoConnect mode")
+
+    monkeypatch.setattr(server, "CHROME_AUTOCONNECT", True)
+    monkeypatch.setattr(server, "CHROME_LAUNCH", False)
+    monkeypatch.setattr(server, "_CDP_URL_SET", False)
+    monkeypatch.setattr(server, "SSH_PROXY_TO", "user@remote")
+    monkeypatch.setattr(server, "SSH_PROXY_PORT", None)
+    monkeypatch.setattr(server, "CHROME_USER_DATA_DIR", "~/.config/google-chrome")
+    monkeypatch.setattr(server, "SshLocalForwardTunnel", boom)
+    monkeypatch.setattr(server, "AutoConnect", make)
+    monkeypatch.setattr(server.mcp, "run", lambda: events.append(("run", server._AUTOCONNECT is made[0])))
+    server.main()
+    assert made[0].args == ("user@remote", "~/.config/google-chrome", None)
+    assert events == [("run", True), "stop"]
+    assert server._AUTOCONNECT is None
+
+
+def test_browser_in_autoconnect_mode_uses_its_hooks(monkeypatch):
+    fake = _FakeAutoConnect()
+    monkeypatch.setattr(server, "_AUTOCONNECT", fake)
+    browser = server._browser()
+    assert browser._connect_wait == 45.0
+    assert browser._ws_url == fake.ws_url
+    assert browser._connect_hook == fake.connect
+    assert browser._wait_message == fake.wait_message
+
+
+def test_ping_and_list_tabs_name_the_autoconnect_source(monkeypatch):
+    monkeypatch.setattr(server, "_AUTOCONNECT", _FakeAutoConnect())
+    _stub(monkeypatch, targets=None)
+    assert asyncio.run(_fn(server.ping)())["cdp_url"] == "autoconnect:~/.config/google-chrome"
+    assert "autoconnect:~/.config/google-chrome" in asyncio.run(_fn(server.list_tabs)())["error"]
+
+
+def test_open_and_resolve_errors_name_the_autoconnect_source(monkeypatch):
+    monkeypatch.setattr(server, "_AUTOCONNECT", _FakeAutoConnect())
+    _stub(monkeypatch, targets=None)
+    assert "autoconnect:~/.config/google-chrome" in asyncio.run(_fn(server.navigate)("https://a"))["error"]
+    assert "autoconnect:~/.config/google-chrome" in asyncio.run(_fn(server.evaluate)("1", "T1"))["error"]
+
+
+def test_user_data_dir_is_ignored_without_autoconnect(monkeypatch):
+    monkeypatch.setattr(server, "CHROME_AUTOCONNECT", False)
+    monkeypatch.setattr(server, "CHROME_LAUNCH", False)
+    monkeypatch.setattr(server, "SSH_PROXY_TO", None)
+    monkeypatch.setattr(server, "CHROME_USER_DATA_DIR", "/somewhere")
+    monkeypatch.setattr(server, "AutoConnect", lambda *a: pytest.fail("AutoConnect must not be built"))
+    monkeypatch.setattr(server.mcp, "run", lambda: None)
+    server.main()
+    assert server._AUTOCONNECT is None

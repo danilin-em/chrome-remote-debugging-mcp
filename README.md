@@ -165,6 +165,8 @@ For a page whose content arrives after load — most single-page applications �
 |-----------|---------------------------|--------------------------------|
 | `CDP_URL` | `http://localhost:9222`   | Chrome remote-debugging origin |
 | `CHROME_LAUNCH` | unset (off)       | `1`/`true`/`yes`/`on` → start a local Chrome on first use instead of connecting to `CDP_URL`. Cannot be combined with `CDP_URL` or `SSH_PROXY_TO`. |
+| `CHROME_AUTOCONNECT` | unset (off) | `1`/`true`/`yes`/`on` → attach to your own running Chrome (see [Attach to your own Chrome](#attach-to-your-own-chrome-autoconnect)). Cannot be combined with `CDP_URL` or `CHROME_LAUNCH`; works with `SSH_PROXY_TO`. |
+| `CHROME_USER_DATA_DIR` | `~/.config/google-chrome` | Chrome profile directory holding `DevToolsActivePort`. Only used with `CHROME_AUTOCONNECT` (on the remote host when `SSH_PROXY_TO` is set). |
 | `MCP_DEBUG_LOG` | unset (off)         | Log every tool call — arguments, result, duration — to a file. `1`/`true`/`yes`/`on` → `/tmp/chrome-remote-debugging-mcp.log`; any other value is the log file path; `0`/`false`/`no`/`off` or empty → off. Read once at startup. |
 
 ## Auto-launch Chrome (optional)
@@ -191,6 +193,48 @@ session that started it exits.
 
 Do not set `CDP_URL` or `SSH_PROXY_TO` together with `CHROME_LAUNCH` — the
 server refuses to start.
+
+## Attach to your own Chrome (autoConnect)
+
+Use your everyday Chrome, with its logins, instead of a separate debugging profile:
+
+```json
+{
+  "mcpServers": {
+    "chrome-remote-debugging": {
+      "command": "uvx",
+      "args": ["chrome-remote-debugging-mcp"],
+      "env": { "CHROME_AUTOCONNECT": "1" }
+    }
+  }
+}
+```
+
+Open `chrome://inspect/#remote-debugging` in that Chrome and switch remote
+debugging on. The server finds Chrome through `<profile>/DevToolsActivePort`
+(`CHROME_USER_DATA_DIR`, default `~/.config/google-chrome`); Chrome serves no
+HTTP in this mode. The first tool call makes Chrome show an **Allow** dialog;
+click it. That is once per server process: the connection then stays open.
+
+- **Debugging is off.** The tool returns "Chrome is not accepting debugging
+  connections: ask the user to enable remote debugging in
+  chrome://inspect/#remote-debugging". Switch it on and call again.
+- **"has not accepted the debugging connection within 45s".** Chrome is
+  waiting for you to click **Allow**. Click it and call the tool again; the
+  pending connection is kept, so no second dialog appears.
+- **"refused the debugging connection (HTTP 403)".** You clicked Deny, or
+  debugging is off. Enable it in `chrome://inspect/#remote-debugging` and click
+  Allow when the dialog shows, then call the tool again.
+- **The connection dropped mid-work** (Chrome restarted, debugging toggled).
+  The next tool call reconnects and Chrome shows one new Allow dialog.
+
+For a Chrome on another machine add `SSH_PROXY_TO` (e.g. `user@remote`) and,
+if needed, `CHROME_USER_DATA_DIR` for the remote profile. The server reads
+`DevToolsActivePort` over `ssh` and opens the `ssh -L` forward itself, on
+demand; the Allow dialog appears on the remote Chrome.
+
+Do not set `CDP_URL` or `CHROME_LAUNCH` together with `CHROME_AUTOCONNECT` —
+the server refuses to start.
 
 ## SSH tunnel (optional)
 

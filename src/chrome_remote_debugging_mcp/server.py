@@ -4,7 +4,8 @@ Run over stdio (the default transport) as a console script or via
 ``python -m chrome_remote_debugging_mcp``. The Chrome endpoint is read from the
 ``CDP_URL`` environment variable (default ``http://localhost:9222``); with
 ``CHROME_LAUNCH`` set, the server starts a local Chrome itself instead (see
-``launcher.py``).
+``launcher.py``); with ``CHROME_AUTOCONNECT`` set, it attaches to the user's own
+Chrome through its ``DevToolsActivePort`` file (see ``autoconnect.py``).
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from mcp.server.fastmcp import FastMCP
 from . import actions, cdp
 from . import browse as browse_engine
 from .tunnel import SshLocalForwardTunnel
+from .autoconnect import ALLOW_WAIT, DEFAULT_USER_DATA_DIR, AutoConnect
 from .launcher import ChromeLauncher
 
 
@@ -58,6 +60,13 @@ CHROME_LAUNCH = _env_flag("CHROME_LAUNCH")
 _CDP_URL_SET = "CDP_URL" in os.environ
 # The launcher while main() is serving with CHROME_LAUNCH, else None.
 _LAUNCHER: ChromeLauncher | None = None
+# CHROME_AUTOCONNECT: attach to the user's own Chrome (debugging enabled in
+# chrome://inspect), locally or over SSH_PROXY_TO. Mutually exclusive with
+# CDP_URL and CHROME_LAUNCH. CHROME_USER_DATA_DIR only matters in this mode.
+CHROME_AUTOCONNECT = _env_flag("CHROME_AUTOCONNECT")
+CHROME_USER_DATA_DIR = os.environ.get("CHROME_USER_DATA_DIR") or DEFAULT_USER_DATA_DIR
+# The address provider while main() is serving with CHROME_AUTOCONNECT, else None.
+_AUTOCONNECT: AutoConnect | None = None
 # The one persistent browser connection, created by the first _browser().
 _BROWSER: cdp.Browser | None = None
 
@@ -66,6 +75,11 @@ mcp = FastMCP("chrome-remote-debugging-mcp")
 
 class _TargetError(Exception):
     """Raised when a usable page target can't be resolved (reported as error)."""
+
+
+def _endpoint() -> str:
+    """Where Chrome is, for user-facing text: the autoConnect source or ``CDP_URL``."""
+    return _AUTOCONNECT.describe() if _AUTOCONNECT is not None else CDP_URL
 
 
 async def _ensure_tunnel() -> None:
@@ -98,11 +112,18 @@ def _browser() -> cdp.Browser:
 
     Its address provider reads ``CDP_URL`` at connect time, not now: a
     respawned tunnel or a relaunched Chrome rewrites ``CDP_URL``, and the
-    next reconnect must follow it.
+    next reconnect must follow it. In autoConnect mode the address, the
+    connect step and the "click Allow" wait all come from ``_AUTOCONNECT``.
     """
     global _BROWSER
     if _BROWSER is None:
-        _BROWSER = cdp.Browser(lambda: cdp.browser_ws_url(CDP_URL))
+        if _AUTOCONNECT is not None:
+            _BROWSER = cdp.Browser(
+                _AUTOCONNECT.ws_url, connect=_AUTOCONNECT.connect,
+                connect_wait=ALLOW_WAIT, wait_message=_AUTOCONNECT.wait_message,
+            )
+        else:
+            _BROWSER = cdp.Browser(lambda: cdp.browser_ws_url(CDP_URL))
     return _BROWSER
 
 
@@ -131,7 +152,7 @@ async def _resolve_target(tab_id: str) -> tuple[dict, cdp.Page]:
     try:
         pages = await _page_targets()
     except Exception as exc:  # network / HTTP failure
-        raise _TargetError(f"cannot reach Chrome at {CDP_URL}: {exc}")
+        raise _TargetError(f"cannot reach Chrome at {_endpoint()}: {exc}")
 
     target = next((t for t in pages if t.get("id") == tab_id), None)
     if target is None:
@@ -147,7 +168,7 @@ async def _open_target() -> tuple[dict, cdp.Page]:
         result = await _browser().call("Target.createTarget", {"url": "about:blank"})
         tab_id = result["targetId"]
     except Exception as exc:
-        raise _TargetError(f"cannot open a new tab at {CDP_URL}: {exc}")
+        raise _TargetError(f"cannot open a new tab at {_endpoint()}: {exc}")
     target = {"id": tab_id, "type": "page", "title": "", "url": "about:blank"}
     return target, cdp.Page(_browser(), tab_id)
 
@@ -171,7 +192,8 @@ def _scoped(fn):
 @mcp.tool()
 @_scoped
 async def ping() -> dict:
-    """Check connectivity to Chrome's DevTools endpoint (``CDP_URL``).
+    """Check connectivity to Chrome's DevTools endpoint (``CDP_URL``, or the
+    autoConnect source with ``CHROME_AUTOCONNECT``).
 
     Returns ``{"connected": True, "cdp_url", "browser", "protocol"}`` when
     Chrome answers, or ``{"connected": False, "cdp_url", "error": ...}`` when it
@@ -182,10 +204,10 @@ async def ping() -> dict:
         await _ensure_chrome()
         info = await _browser().call("Browser.getVersion")
     except Exception as exc:
-        return {"connected": False, "cdp_url": CDP_URL, "error": str(exc)}
+        return {"connected": False, "cdp_url": _endpoint(), "error": str(exc)}
     return {
         "connected": True,
-        "cdp_url": CDP_URL,
+        "cdp_url": _endpoint(),
         "browser": info.get("product"),
         "protocol": info.get("protocolVersion"),
     }
@@ -202,7 +224,7 @@ async def list_tabs() -> dict:
     try:
         pages = await _page_targets()
     except Exception as exc:
-        return {"error": f"cannot reach Chrome at {CDP_URL}: {exc}"}
+        return {"error": f"cannot reach Chrome at {_endpoint()}: {exc}"}
     return {
         "tabs": [
             {
@@ -454,15 +476,24 @@ def main() -> None:
     launch yet: the first tool call that needs Chrome starts it (or attaches
     to the one already serving the profile). Chrome is closed on exit only if
     this server launched it.
+
+    When ``CHROME_AUTOCONNECT`` is set, create an :class:`AutoConnect` (no
+    eager tunnel: with ``SSH_PROXY_TO`` it opens its own lazily, and reads the
+    remote ``DevToolsActivePort`` over ssh). It is stopped on exit.
     """
-    global CDP_URL, _TUNNEL, _LAUNCHER
+    global CDP_URL, _TUNNEL, _LAUNCHER, _AUTOCONNECT
+    if CHROME_AUTOCONNECT and (_CDP_URL_SET or CHROME_LAUNCH):
+        raise SystemExit(
+            "CHROME_AUTOCONNECT cannot be combined with CDP_URL or CHROME_LAUNCH: "
+            "it reads the debugging address from Chrome's DevToolsActivePort itself"
+        )
     if CHROME_LAUNCH and (_CDP_URL_SET or SSH_PROXY_TO):
         raise SystemExit(
             "CHROME_LAUNCH cannot be combined with CDP_URL or SSH_PROXY_TO: "
             "either launch a local Chrome or connect to an existing one"
         )
     tunnel: SshLocalForwardTunnel | None = None
-    if SSH_PROXY_TO:
+    if SSH_PROXY_TO and not CHROME_AUTOCONNECT:
         host, port = _split_endpoint(CDP_URL)
         tunnel = SshLocalForwardTunnel(SSH_PROXY_TO, host, port, SSH_PROXY_PORT)
         tunnel.start()
@@ -472,9 +503,16 @@ def main() -> None:
     if CHROME_LAUNCH:
         launcher = ChromeLauncher()
         _LAUNCHER = launcher
+    autoconnect: AutoConnect | None = None
+    if CHROME_AUTOCONNECT:
+        autoconnect = AutoConnect(SSH_PROXY_TO, CHROME_USER_DATA_DIR, SSH_PROXY_PORT)
+        _AUTOCONNECT = autoconnect
     try:
         mcp.run()
     finally:
+        if autoconnect is not None:
+            _AUTOCONNECT = None
+            autoconnect.stop()
         if tunnel is not None:
             _TUNNEL = None
             tunnel.stop()
