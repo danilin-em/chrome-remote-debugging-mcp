@@ -2,6 +2,9 @@ import asyncio
 import subprocess
 
 import pytest
+import websockets
+import websockets.datastructures
+import websockets.http11
 
 from chrome_remote_debugging_mcp import autoconnect, cdp
 from chrome_remote_debugging_mcp.autoconnect import (
@@ -179,3 +182,62 @@ def test_stop_is_idempotent(ssh):
     ac.stop()
     ac.stop()
     assert FakeTunnel.instances[0].calls.count("stop") == 1
+
+
+def _status(code):
+    return websockets.InvalidStatus(
+        websockets.http11.Response(code, "x", websockets.datastructures.Headers())
+    )
+
+
+def _patch_connect(monkeypatch, result=None, exc=None):
+    seen = {}
+
+    async def fake(url, **kwargs):
+        seen["url"], seen["kwargs"] = url, kwargs
+        if exc is not None:
+            raise exc
+        return result
+
+    monkeypatch.setattr(autoconnect.websockets, "connect", fake)
+    return seen
+
+
+def test_connect_returns_socket_without_handshake_timeout(monkeypatch):
+    sentinel = object()
+    seen = _patch_connect(monkeypatch, result=sentinel)
+    ac = AutoConnect(None, "/d", None)
+    assert asyncio.run(ac.connect("ws://x")) is sentinel
+    assert seen["url"] == "ws://x"
+    assert seen["kwargs"] == {"max_size": None, "open_timeout": None}
+
+
+@pytest.mark.parametrize("target,where", [(None, ""), ("u@h", " on u@h")])
+def test_connect_403_explains_allow(monkeypatch, target, where):
+    _patch_connect(monkeypatch, exc=_status(403))
+    with pytest.raises(AutoConnectError) as e:
+        asyncio.run(AutoConnect(target, "/d", None).connect("ws://x"))
+    assert f"Chrome{where} refused the debugging connection (HTTP 403)" in str(e.value)
+    assert "Allow" in str(e.value)
+    assert isinstance(e.value.__cause__, websockets.InvalidStatus)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [_status(500), websockets.InvalidMessage("did not receive a valid HTTP response"),
+     ConnectionRefusedError(), EOFError()],
+)
+def test_connect_dead_port_is_not_debuggable(monkeypatch, exc):
+    _patch_connect(monkeypatch, exc=exc)
+    with pytest.raises(AutoConnectError) as e:
+        asyncio.run(AutoConnect(None, "/d", None).connect("ws://x"))
+    assert "is not accepting debugging connections" in str(e.value)
+    assert type(exc).__name__ in str(e.value)
+    assert e.value.__cause__ is exc
+
+
+def test_wait_message():
+    assert "45s" in AutoConnect(None, "/d", None).wait_message
+    assert "Allow" in AutoConnect(None, "/d", None).wait_message
+    assert "Chrome has not accepted" in AutoConnect(None, "/d", None).wait_message
+    assert "Chrome on u@h has not accepted" in AutoConnect("u@h", "/d", None).wait_message

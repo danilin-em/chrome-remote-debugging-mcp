@@ -18,6 +18,8 @@ import os
 import shlex
 import subprocess
 
+import websockets
+
 from .tunnel import SSH_OPTIONS, SshLocalForwardTunnel
 
 DEFAULT_USER_DATA_DIR = "~/.config/google-chrome"
@@ -55,12 +57,47 @@ class AutoConnect:
             return f"autoconnect:{self.ssh_target}:{self.user_data_dir}"
         return f"autoconnect:{self.user_data_dir}"
 
+    @property
+    def _where(self) -> str:
+        return f" on {self.ssh_target}" if self.ssh_target else ""
+
     def not_debuggable(self, detail: str) -> str:
-        where = f" on {self.ssh_target}" if self.ssh_target else ""
         return (
-            f"Chrome{where} is not accepting debugging connections: ask the user to "
+            f"Chrome{self._where} is not accepting debugging connections: ask the user to "
             f"enable remote debugging in chrome://inspect/#remote-debugging ({detail})"
         )
+
+    @property
+    def wait_message(self) -> str:
+        return (
+            f"Chrome{self._where} has not accepted the debugging connection within "
+            f"{ALLOW_WAIT:.0f}s: it is probably showing an \"Allow\" dialog. Ask the user "
+            "to click Allow in Chrome, then call the tool again; the pending connection "
+            "is kept, so no second dialog appears"
+        )
+
+    async def connect(self, url: str):
+        """Open the browser websocket with no handshake timeout.
+
+        While Chrome shows its "Allow" dialog the handshake hangs; a timeout would
+        abandon the attempt and the next call would open a second dialog. The
+        attempt ends on its own: Allow -> socket, Deny / debugging off -> HTTP 403,
+        connection closed -> error.
+        """
+        try:
+            return await websockets.connect(url, max_size=None, open_timeout=None)
+        except websockets.InvalidStatus as exc:
+            if exc.response.status_code == 403:
+                raise AutoConnectError(
+                    f"Chrome{self._where} refused the debugging connection (HTTP 403): "
+                    "the Allow dialog was declined or remote debugging is off. Ask the "
+                    "user to enable remote debugging in chrome://inspect/#remote-debugging "
+                    "and click Allow, then call the tool again"
+                ) from exc
+            raise AutoConnectError(self.not_debuggable(f"{type(exc).__name__}: {exc}")) from exc
+        except (websockets.InvalidHandshake, OSError, EOFError) as exc:
+            # A stale DevToolsActivePort: refused locally, accepted-then-closed by an ssh tunnel.
+            raise AutoConnectError(self.not_debuggable(f"{type(exc).__name__}: {exc}")) from exc
 
     async def ws_url(self) -> str:
         if self.ssh_target:
