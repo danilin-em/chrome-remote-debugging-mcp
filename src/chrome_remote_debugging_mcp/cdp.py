@@ -55,8 +55,9 @@ class CDPTimeout(TimeoutError):
 class CDPConnectTimeout(CDPTimeout):
     """Raised when a caller's connect wait ends before the attempt finishes.
 
-    The attempt itself keeps running, so the next call joins it. Not a
-    :class:`CDPError`, for the same reason as :class:`CDPTimeout`.
+    The attempt itself keeps running, so the next call joins it (or gets its
+    failure, see :class:`Browser`). Not a :class:`CDPError`, for the same
+    reason as :class:`CDPTimeout`.
     """
 
 
@@ -129,7 +130,8 @@ class Browser:
     one flattened session (:meth:`session`), reused by every command sent
     to it until the tab detaches or the connection dies. The connection is
     opened lazily by the first :meth:`call` and, once it dies, reopened by
-    the next one — never retried on its own. ``ws_url`` is asked for the
+    the next one — never retried on its own, and not within the
+    :func:`call_scope` that saw it die. ``ws_url`` is asked for the
     address on every (re)connect, so a respawned tunnel or a relaunched
     Chrome on a new port is picked up.
 
@@ -137,7 +139,9 @@ class Browser:
     with :data:`CONNECT_TIMEOUT`). ``connect_wait`` caps how long one caller
     waits for a connect attempt: past it the caller gets
     :class:`CDPConnectTimeout` (text ``wait_message``) while the attempt keeps
-    running for the next call. ``None`` waits as long as the attempt lasts.
+    running for the next call; if it then fails with no caller left to tell,
+    the next call raises that failure once instead of connecting again.
+    ``None`` waits as long as the attempt lasts.
     """
 
     def __init__(self, ws_url: Callable[[], Awaitable[str]], *,
@@ -151,6 +155,9 @@ class Browser:
         self._ws = None  # live socket, or None when not connected
         self._reader: asyncio.Task | None = None
         self._connecting: asyncio.Task | None = None
+        # The failure of a finished attempt that no waiter received (they all
+        # timed out or were cancelled); the next _open raises it once.
+        self._unreceived: BaseException | None = None
         # (session id, future) of each call awaiting a reply, by command id.
         # Callers await the future through asyncio.shield, so an entry is
         # never cancelled under the reader; it leaves the dict when it is
@@ -282,12 +289,14 @@ class Browser:
     async def _open(self):
         if self._ws is not None:
             return self._ws
+        if self._unreceived is not None:
+            # Report the abandoned attempt's outcome (e.g. a declined Allow
+            # dialog) instead of dialling again; only once.
+            error, self._unreceived = self._unreceived, None
+            raise error
         if self._connecting is None:
             self._connecting = asyncio.ensure_future(self._connect())
-            # If every waiter gave up, nobody reads a failure: retrieve it so
-            # asyncio does not log "Task exception was never retrieved".
-            self._connecting.add_done_callback(
-                lambda t: t.cancelled() or t.exception())
+            self._connecting.add_done_callback(self._attempt_done)
         connecting = self._connecting
         done, _ = await asyncio.wait({connecting}, timeout=self._connect_wait)
         if not done:
@@ -296,7 +305,21 @@ class Browser:
             raise CDPConnectTimeout(
                 self._wait_message
                 or f"no connection to Chrome within {self._connect_wait}s")
-        return connecting.result()
+        try:
+            return connecting.result()
+        except Exception as exc:
+            if self._unreceived is exc:
+                self._unreceived = None  # received here: not kept
+            raise
+
+    def _attempt_done(self, attempt: asyncio.Task) -> None:
+        # Retrieving the failure also keeps asyncio from logging "Task
+        # exception was never retrieved". It runs before any waiter resumes,
+        # so the failure is kept tentatively; each waiter that receives it
+        # clears it (_open). Not kept if a newer attempt already started.
+        error = None if attempt.cancelled() else attempt.exception()
+        if error is not None and self._connecting is None:
+            self._unreceived = error
 
     @staticmethod
     async def _default_connect(url: str):

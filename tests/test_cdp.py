@@ -923,6 +923,76 @@ def test_cancelled_waiter_keeps_the_attempt(monkeypatch):
     assert contexts == []
 
 
+def _failing_then_echo_hook(error):
+    """A connect hook whose first attempt blocks on ``hook.gate`` and then
+    raises ``error``; later attempts hand out an echo socket."""
+    gate = asyncio.Event()
+    calls = []
+
+    async def hook(url):
+        calls.append(url)
+        if len(calls) == 1:
+            await gate.wait()
+            raise error
+        return FakeBrowserWS(_echo)
+
+    hook.gate, hook.calls = gate, calls
+    return hook
+
+
+def test_a_failure_no_waiter_received_is_raised_by_the_next_call(monkeypatch):
+    # The wait expires, then the user clicks Deny: the next call must report
+    # that 403 instead of dialling again (a new dialog) and blaming the wait.
+    monkeypatch.setattr(cdp, "_ids", itertools.count(1))
+    denied = OSError("HTTP 403")
+    hook = _failing_then_echo_hook(denied)
+    b = cdp.Browser(_provider("ws://x"), connect=hook, connect_wait=0.05)
+
+    async def scenario():
+        contexts = _record_loop_errors(asyncio.get_running_loop())
+        with cdp.call_scope():
+            with pytest.raises(cdp.CDPConnectTimeout):
+                await b.call("A.a")
+        hook.gate.set()
+        await _settle()
+        with cdp.call_scope():
+            with pytest.raises(OSError) as info:
+                await b.call("A.b")
+            assert len(hook.calls) == 1  # raised without a second connect
+        with cdp.call_scope():
+            result = await b.call("A.c")  # raised once: this one dials
+        return contexts, info.value, result
+
+    contexts, kept, result = asyncio.run(scenario())
+    assert kept is denied
+    assert result == {"ok": "A.c"}
+    assert len(hook.calls) == 2
+    assert contexts == []
+
+
+def test_a_failure_a_waiter_received_is_not_kept(monkeypatch):
+    monkeypatch.setattr(cdp, "_ids", itertools.count(1))
+    denied = OSError("HTTP 403")
+    hook = _failing_then_echo_hook(denied)
+    b = cdp.Browser(_provider("ws://x"), connect=hook)
+
+    async def scenario():
+        gave_up = asyncio.ensure_future(b.call("A.a"))
+        waiting = asyncio.ensure_future(b.call("B.b"))
+        await _settle()
+        gave_up.cancel()
+        hook.gate.set()
+        with pytest.raises(OSError) as info:
+            await waiting
+        await asyncio.wait({gave_up})
+        return info.value, await b.call("C.c")
+
+    received, result = asyncio.run(scenario())
+    assert received is denied
+    assert result == {"ok": "C.c"}
+    assert len(hook.calls) == 2
+
+
 def test_concurrent_scoped_calls_share_one_attempt(monkeypatch):
     monkeypatch.setattr(cdp, "_ids", itertools.count(1))
     hook = _gated_hook()
