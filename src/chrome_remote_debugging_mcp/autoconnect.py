@@ -93,7 +93,8 @@ class AutoConnect:
         try:
             proc = subprocess.run(
                 ["ssh", *SSH_OPTIONS, self.ssh_target, f"cat -- {remote_path}"],
-                capture_output=True, text=True, timeout=SSH_READ_TIMEOUT,
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                timeout=SSH_READ_TIMEOUT,
             )
         except subprocess.TimeoutExpired as exc:
             raise AutoConnectError(
@@ -120,6 +121,7 @@ class AutoConnect:
         if tunnel is not None:
             self._local_port = tunnel.local_port
             tunnel.stop()
+            self._tunnel = None  # a failed start below must not leave the stopped one
         tunnel = SshLocalForwardTunnel(self.ssh_target, "127.0.0.1", remote_port, self._local_port)
         tunnel.start()
         self._tunnel = tunnel

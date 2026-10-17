@@ -108,6 +108,23 @@ def test_remote_tunnel_lifecycle(ssh):
     assert second.calls == ["start"]
 
 
+def test_failed_repoint_is_retried_not_silently_reused(ssh, monkeypatch):
+    ac = AutoConnect("u@h", "~/d", None)
+    asyncio.run(ac.ws_url())
+    old = FakeTunnel.instances[0]
+    ssh["out"] = "9333\n/devtools/browser/xyz\n"
+    monkeypatch.setattr(FakeTunnel, "start", lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(ac.ws_url())
+    monkeypatch.undo()
+    monkeypatch.setattr(autoconnect.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "9222\n/devtools/browser/abc\n", ""))
+    monkeypatch.setattr(autoconnect, "SshLocalForwardTunnel", FakeTunnel)
+    asyncio.run(ac.ws_url())  # old port again: must start a fresh tunnel
+    fresh = FakeTunnel.instances[-1]
+    assert fresh is not old and fresh.calls == ["start"]
+    assert fresh.args[3] == 5555
+
+
 def test_remote_command_quotes_dir_but_expands_tilde(ssh):
     ac = AutoConnect("u@h", "~/my dir", None)
     asyncio.run(ac.ws_url())
@@ -117,6 +134,7 @@ def test_remote_command_quotes_dir_but_expands_tilde(ssh):
     assert "ExitOnForwardFailure=yes" not in ssh["argv"]
     assert "BatchMode=yes" in ssh["argv"]
     assert ssh["kw"]["timeout"] == autoconnect.SSH_READ_TIMEOUT
+    assert ssh["kw"]["stdin"] == subprocess.DEVNULL  # never the MCP stdio channel
 
 
 def test_remote_command_absolute_dir_is_quoted(ssh):
