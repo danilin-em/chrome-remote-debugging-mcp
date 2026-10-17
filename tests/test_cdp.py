@@ -833,3 +833,115 @@ def test_scope_stops_a_swallowing_retry_loop_from_reconnecting(monkeypatch):
 
     asyncio.run(scenario())
     assert len(connects) == 1
+
+
+# --- pluggable connect and the caller-side connect wait ---------------------
+
+
+def _gated_hook():
+    """A connect hook that blocks on ``hook.gate`` and then hands out an echo
+    socket. ``hook.calls`` logs the urls it was called with."""
+    gate = asyncio.Event()
+    calls = []
+
+    async def hook(url):
+        calls.append(url)
+        await gate.wait()
+        return FakeBrowserWS(_echo)
+
+    hook.gate, hook.calls = gate, calls
+    return hook
+
+
+def _record_loop_errors(loop):
+    contexts = []
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    return contexts
+
+
+def test_connect_wait_times_out_but_keeps_the_attempt(monkeypatch):
+    monkeypatch.setattr(cdp, "_ids", itertools.count(1))
+    hook = _gated_hook()
+    b = cdp.Browser(_provider("ws://x"), connect=hook, connect_wait=0.05,
+                    wait_message="click Allow")
+
+    async def scenario():
+        contexts = _record_loop_errors(asyncio.get_running_loop())
+        with cdp.call_scope():
+            with pytest.raises(cdp.CDPConnectTimeout, match="click Allow"):
+                await b.call("A.a")
+        hook.gate.set()
+        await _settle()
+        with cdp.call_scope():
+            result = await b.call("A.b")
+        return contexts, result
+
+    contexts, result = asyncio.run(scenario())
+    assert result == {"ok": "A.b"}
+    assert hook.calls == ["ws://x"]
+    assert contexts == []
+
+
+def test_connect_wait_default_message(monkeypatch):
+    hook = _gated_hook()
+    b = cdp.Browser(_provider("ws://x"), connect=hook, connect_wait=0.05)
+
+    with pytest.raises(cdp.CDPConnectTimeout,
+                       match="no connection to Chrome within 0.05s"):
+        asyncio.run(b.call("A.a"))
+
+
+def test_connect_wait_does_not_mistake_the_attempts_own_timeout(monkeypatch):
+    async def hook(url):
+        raise TimeoutError("handshake")
+
+    b = cdp.Browser(_provider("ws://x"), connect=hook, connect_wait=5)
+
+    with pytest.raises(TimeoutError, match="handshake") as info:
+        asyncio.run(b.call("A.a"))
+    assert not isinstance(info.value, cdp.CDPConnectTimeout)
+
+
+def test_cancelled_waiter_keeps_the_attempt(monkeypatch):
+    monkeypatch.setattr(cdp, "_ids", itertools.count(1))
+    hook = _gated_hook()
+    b = cdp.Browser(_provider("ws://x"), connect=hook)
+
+    async def scenario():
+        contexts = _record_loop_errors(asyncio.get_running_loop())
+        first = asyncio.ensure_future(b.call("A.a"))
+        await _settle()
+        first.cancel()
+        await asyncio.wait({first})
+        hook.gate.set()
+        await _settle()
+        return contexts, await b.call("A.b")
+
+    contexts, result = asyncio.run(scenario())
+    assert result == {"ok": "A.b"}
+    assert hook.calls == ["ws://x"]
+    assert contexts == []
+
+
+def test_concurrent_scoped_calls_share_one_attempt(monkeypatch):
+    monkeypatch.setattr(cdp, "_ids", itertools.count(1))
+    hook = _gated_hook()
+    b = cdp.Browser(_provider("ws://x"), connect=hook)
+
+    async def scoped(method):
+        with cdp.call_scope():
+            return await b.call(method)
+
+    async def scenario():
+        both = asyncio.gather(scoped("A.a"), scoped("B.b"))
+        await _settle()
+        hook.gate.set()
+        return await both
+
+    assert asyncio.run(scenario()) == [{"ok": "A.a"}, {"ok": "B.b"}]
+    assert hook.calls == ["ws://x"]
+
+
+def test_connect_timeout_is_a_timeout_not_a_cdp_error():
+    assert issubclass(cdp.CDPConnectTimeout, cdp.CDPTimeout)
+    assert not issubclass(cdp.CDPConnectTimeout, cdp.CDPError)

@@ -52,6 +52,14 @@ class CDPTimeout(TimeoutError):
     """
 
 
+class CDPConnectTimeout(CDPTimeout):
+    """Raised when a caller's connect wait ends before the attempt finishes.
+
+    The attempt itself keeps running, so the next call joins it. Not a
+    :class:`CDPError`, for the same reason as :class:`CDPTimeout`.
+    """
+
+
 class CDPDisconnected(ConnectionError):
     """Raised when the browser connection closed before a command's reply.
 
@@ -124,10 +132,22 @@ class Browser:
     the next one — never retried on its own. ``ws_url`` is asked for the
     address on every (re)connect, so a respawned tunnel or a relaunched
     Chrome on a new port is picked up.
+
+    ``connect`` opens the websocket for a url (default: ``websockets.connect``
+    with :data:`CONNECT_TIMEOUT`). ``connect_wait`` caps how long one caller
+    waits for a connect attempt: past it the caller gets
+    :class:`CDPConnectTimeout` (text ``wait_message``) while the attempt keeps
+    running for the next call. ``None`` waits as long as the attempt lasts.
     """
 
-    def __init__(self, ws_url: Callable[[], Awaitable[str]]) -> None:
+    def __init__(self, ws_url: Callable[[], Awaitable[str]], *,
+                 connect: Callable[[str], Awaitable] | None = None,
+                 connect_wait: float | None = None,
+                 wait_message: str | None = None) -> None:
         self._ws_url = ws_url
+        self._connect_hook = connect or self._default_connect
+        self._connect_wait = connect_wait
+        self._wait_message = wait_message
         self._ws = None  # live socket, or None when not connected
         self._reader: asyncio.Task | None = None
         self._connecting: asyncio.Task | None = None
@@ -238,7 +258,8 @@ class Browser:
 
         Concurrent callers share one connect attempt. They wait on it with
         ``asyncio.wait``, which a cancelled caller abandons without cancelling
-        the attempt the others are waiting on. Inside a :func:`call_scope`
+        the attempt the others are waiting on; the same goes for a caller
+        whose ``connect_wait`` expires. Inside a :func:`call_scope`
         it connects at most once (see there).
         """
         scope = _scope.get()
@@ -268,13 +289,24 @@ class Browser:
             self._connecting.add_done_callback(
                 lambda t: t.cancelled() or t.exception())
         connecting = self._connecting
-        await asyncio.wait({connecting})
+        done, _ = await asyncio.wait({connecting}, timeout=self._connect_wait)
+        if not done:
+            # Decided by "not done", not by catching TimeoutError: the attempt
+            # may itself fail with one, and that must reach the caller as is.
+            raise CDPConnectTimeout(
+                self._wait_message
+                or f"no connection to Chrome within {self._connect_wait}s")
         return connecting.result()
+
+    @staticmethod
+    async def _default_connect(url: str):
+        # Looked up at call time, so a test can monkeypatch websockets.connect.
+        return await websockets.connect(
+            url, max_size=None, open_timeout=CONNECT_TIMEOUT)
 
     async def _connect(self):
         try:
-            ws = await websockets.connect(
-                await self._ws_url(), max_size=None, open_timeout=CONNECT_TIMEOUT)
+            ws = await self._connect_hook(await self._ws_url())
         finally:
             self._connecting = None  # a failed attempt is not reused
         self._ws = ws
