@@ -19,7 +19,7 @@ class _Snapshot(NamedTuple):
 
     ``refs`` maps a ref to the ``(frame_id, backend_node_id)`` it resolved to.
     ``main_frame_id`` lets an action honestly refuse a ref that lives in a
-    child frame (I2): every action goes to the page-target websocket, which
+    child frame (I2): every action goes to the page-target session, which
     only ever addresses the main frame's renderer, so a node in another frame
     cannot actually be clicked from here. ``loader_id`` is the main frame's
     ``Page.Frame.loaderId`` at snapshot time; a cross-process navigation
@@ -79,10 +79,10 @@ def _frame_ids(frame_tree: dict) -> list[str]:
     return out
 
 
-async def _page_header(ws_url: str) -> tuple[str, str]:
+async def _page_header(page: cdp.Page) -> tuple[str, str]:
     """Current url and title, or placeholders when the page has no JS context."""
     try:
-        result = await cdp.send(ws_url, "Runtime.evaluate", {
+        result = await cdp.send(page, "Runtime.evaluate", {
             "expression": "[location.href, document.title]",
             "returnByValue": True,
         })
@@ -92,12 +92,12 @@ async def _page_header(ws_url: str) -> tuple[str, str]:
         return "(unknown)", "(unknown)"
 
 
-async def _attributes_for(ws_url: str, backend_ids: list[int]) -> dict[int, dict]:
+async def _attributes_for(page: cdp.Page, backend_ids: list[int]) -> dict[int, dict]:
     """DOM attributes of the nodes Chrome could not name (R7)."""
     attrs: dict[int, dict] = {}
     for backend_id in backend_ids:
         try:
-            node = await cdp.send(ws_url, "DOM.describeNode",
+            node = await cdp.send(page, "DOM.describeNode",
                                   {"backendNodeId": backend_id})
         except Exception:
             continue
@@ -106,7 +106,7 @@ async def _attributes_for(ws_url: str, backend_ids: list[int]) -> dict[int, dict
     return attrs
 
 
-async def snapshot(ws_url: str, tab_id: str) -> tuple[str, int, str]:
+async def snapshot(page: cdp.Page, tab_id: str) -> tuple[str, int, str]:
     """Render the whole page — every frame — and refresh the tab's registry.
 
     Returns ``(view, ref_count, url)``, where ``url`` is the location the
@@ -117,22 +117,22 @@ async def snapshot(ws_url: str, tab_id: str) -> tuple[str, int, str]:
     tab cannot interleave and leave the registry holding a mix of both.
     """
     async with _lock_for(tab_id):
-        frame_tree = await cdp.send(ws_url, "Page.getFrameTree")
+        frame_tree = await cdp.send(page, "Page.getFrameTree")
         frame_ids = _frame_ids(frame_tree)
         main_frame_id = frame_ids[0]
         loader_id = frame_tree["frameTree"]["frame"].get("loaderId")
-        url, title = await _page_header(ws_url)
+        url, title = await _page_header(page)
 
         lines = [f"url    {url}", f"title  {title}", ""]
         registry: dict[int, tuple[str, int]] = {}
         ref_count = 0
 
         for index, frame_id in enumerate(frame_ids):
-            tree = await cdp.send(ws_url, "Accessibility.getFullAXTree",
+            tree = await cdp.send(page, "Accessibility.getFullAXTree",
                                   {"frameId": frame_id})
             nodes = tree.get("nodes", [])
             ax.strip_sources(nodes)
-            attrs = await _attributes_for(ws_url, ax.unnamed_backend_ids(nodes))
+            attrs = await _attributes_for(page, ax.unnamed_backend_ids(nodes))
             frame_lines, frame_refs = ax.render_nodes(nodes, ref_count, attrs=attrs,
                                                      base_url=url)
             if not frame_lines:
@@ -164,7 +164,7 @@ def _resolve(state: _Snapshot, ref) -> int:
 
     A ref that resolved in a frame other than the main frame is refused
     outright (I2): every action here is dispatched against the page target's
-    own websocket, which can only ever reach the main frame's renderer — a
+    own tab session, which can only ever reach the main frame's renderer — a
     node from a same- or cross-origin child frame lives in a different
     coordinate space (and, for a cross-origin frame, a different renderer
     process) that this tool has no way to address. Refusing honestly, rather
@@ -187,29 +187,29 @@ def _resolve(state: _Snapshot, ref) -> int:
     return backend_id
 
 
-async def _perform(ws_url: str, state: _Snapshot, action: dict) -> str | None:
+async def _perform(page: cdp.Page, state: _Snapshot, action: dict) -> str | None:
     """Run one action. Returns an optional detail string for the step result."""
     verb = action.get("do")
     ref = action.get("ref")
     backend_id = _resolve(state, ref) if verb in _NEEDS_REF else None
 
     if verb == "click":
-        await actions.click(ws_url, ref, backend_id)
+        await actions.click(page, ref, backend_id)
         return None
     if verb == "type":
-        await actions.type_text(ws_url, ref, backend_id,
+        await actions.type_text(page, ref, backend_id,
                                 action.get("text", ""),
                                 bool(action.get("clear", False)))
         return None
     if verb == "press":
-        await actions.press(ws_url, action.get("key", ""))
+        await actions.press(page, action.get("key", ""))
         return None
     if verb == "select":
-        await actions.select(ws_url, ref, backend_id, action.get("value", ""))
+        await actions.select(page, ref, backend_id, action.get("value", ""))
         return None
     if verb in ("check", "uncheck"):
         target = verb == "check"
-        moved = await actions.set_checked(ws_url, ref, backend_id, target)
+        moved = await actions.set_checked(page, ref, backend_id, target)
         return None if moved else f"already {'checked' if target else 'unchecked'}"
     if verb == "scroll":
         scroll_ref = action.get("ref")
@@ -218,10 +218,10 @@ async def _perform(ws_url: str, state: _Snapshot, action: dict) -> str | None:
         # every other verb uses — an unknown ref must raise, not be treated
         # as if no ref were given at all.
         scroll_backend = _resolve(state, scroll_ref) if scroll_ref is not None else None
-        await actions.scroll(ws_url, scroll_ref, scroll_backend, action.get("to"))
+        await actions.scroll(page, scroll_ref, scroll_backend, action.get("to"))
         return None
     if verb == "hover":
-        await actions.hover(ws_url, ref, backend_id)
+        await actions.hover(page, ref, backend_id)
         return None
     if verb == "wait_for":
         text = action.get("text")
@@ -233,19 +233,19 @@ async def _perform(ws_url: str, state: _Snapshot, action: dict) -> str | None:
                 "wait_for takes either text or ref_gone, not both"
             )
         gone_backend = _resolve(state, gone) if gone is not None else None
-        await actions.wait_for(ws_url, text, gone, gone_backend,
+        await actions.wait_for(page, text, gone, gone_backend,
                                float(action.get("timeout", 5.0)))
         return None
     raise actions.ActionError(f'unknown action "{verb}"')
 
 
-async def _current_loader_id(ws_url: str) -> str | None:
+async def _current_loader_id(page: cdp.Page) -> str | None:
     """The main frame's ``loaderId`` right now, straight from Chrome."""
-    frame_tree = await cdp.send(ws_url, "Page.getFrameTree")
+    frame_tree = await cdp.send(page, "Page.getFrameTree")
     return frame_tree["frameTree"]["frame"].get("loaderId")
 
 
-async def run_actions(ws_url: str, tab_id: str,
+async def run_actions(page: cdp.Page, tab_id: str,
                       action_list: list[dict]) -> tuple[list[dict], str | None]:
     """Run a batch against the tab's current view.
 
@@ -264,7 +264,7 @@ async def run_actions(ws_url: str, tab_id: str,
     # browse_view and browse_act, or a person switches the tab by hand — so
     # every batch re-checks the stamp taken at snapshot time before acting.
     try:
-        current_loader_id = await _current_loader_id(ws_url)
+        current_loader_id = await _current_loader_id(page)
     except Exception as exc:
         return [], f"could not verify the page is unchanged: {exc}"
     if current_loader_id != state.loader_id:
@@ -274,7 +274,7 @@ async def run_actions(ws_url: str, tab_id: str,
     for action in action_list:
         verb = action.get("do")
         try:
-            detail = await _perform(ws_url, state, action)
+            detail = await _perform(page, state, action)
         except actions.ActionError as exc:
             steps.append({"do": verb, "ok": False, "error": str(exc)})
             return steps, str(exc)
@@ -286,5 +286,5 @@ async def run_actions(ws_url: str, tab_id: str,
         if detail:
             step["detail"] = detail
         steps.append(step)
-        await actions.settle(ws_url)
+        await actions.settle(page)
     return steps, None

@@ -158,7 +158,8 @@ def test_select_sets_the_value_and_fires_events(monkeypatch):
     })
     _install(monkeypatch, rec)
     asyncio.run(actions.select(WS, 4, 77, "два"))
-    assert rec.methods() == ["DOM.resolveNode", "Runtime.callFunctionOn"]
+    assert rec.methods() == ["DOM.resolveNode", "Runtime.callFunctionOn",
+                             "Runtime.releaseObject"]
     params = rec.calls[1][1]
     assert params["objectId"] == "OBJ1"
     assert params["arguments"] == [{"value": "два"}]
@@ -191,6 +192,35 @@ def test_select_propagates_transport_errors(monkeypatch):
     _install(monkeypatch, rec)
     with pytest.raises(OSError, match="Connection refused"):
         asyncio.run(actions.select(WS, 4, 77, "два"))
+
+
+def test_call_on_node_releases_the_resolved_object(monkeypatch):
+    rec = Recorder(replies={
+        "DOM.resolveNode": {"object": {"objectId": "O1"}},
+        "Runtime.callFunctionOn": {"result": {"value": True}},
+    })
+    _install(monkeypatch, rec)
+    asyncio.run(actions.set_checked(WS, 9, 77, True))
+    assert ("Runtime.releaseObject", {"objectId": "O1"}) in rec.calls
+
+
+def test_call_on_node_release_failure_is_ignored(monkeypatch):
+    rec = Recorder(replies={
+        "DOM.resolveNode": {"object": {"objectId": "O1"}},
+        "Runtime.callFunctionOn": {"result": {"value": True}},
+    }, errors={"Runtime.releaseObject": cdp.CDPError("gone")})
+    _install(monkeypatch, rec)
+    assert asyncio.run(actions.set_checked(WS, 9, 77, True)) is False
+    assert ("Runtime.releaseObject", {"objectId": "O1"}) in rec.calls
+
+
+def test_call_on_node_releases_even_when_the_call_fails(monkeypatch):
+    rec = Recorder(replies={"DOM.resolveNode": {"object": {"objectId": "O1"}}},
+                   errors={"Runtime.callFunctionOn": cdp.CDPError("boom")})
+    _install(monkeypatch, rec)
+    with pytest.raises(actions.ActionError, match="stale"):
+        asyncio.run(actions.select(WS, 4, 77, "два"))
+    assert ("Runtime.releaseObject", {"objectId": "O1"}) in rec.calls
 
 
 def test_set_checked_clicks_only_when_the_state_differs(monkeypatch):

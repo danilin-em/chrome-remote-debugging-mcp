@@ -22,27 +22,27 @@ class ActionError(Exception):
     """Raised when an action cannot be performed, with an agent-readable cause."""
 
 
-async def resolve_box(ws_url: str, ref: int, backend_id: int) -> tuple[float, float]:
+async def resolve_box(page: cdp.Page, ref: int, backend_id: int) -> tuple[float, float]:
     """Scroll the node into view and return its content-box centre.
 
     A node that no longer has a box model is gone from the page, which is how a
     stale ref surfaces (see D4 in the design document).
     """
     try:
-        await cdp.send(ws_url, "DOM.scrollIntoViewIfNeeded",
+        await cdp.send(page, "DOM.scrollIntoViewIfNeeded",
                        {"backendNodeId": backend_id})
-        box = await cdp.send(ws_url, "DOM.getBoxModel", {"backendNodeId": backend_id})
+        box = await cdp.send(page, "DOM.getBoxModel", {"backendNodeId": backend_id})
     except cdp.CDPError as exc:
         raise ActionError(f"ref {ref} is stale; take a new snapshot ({exc})")
     quad = box["model"]["content"]
     return (quad[0] + quad[4]) / 2, (quad[1] + quad[5]) / 2
 
 
-async def click(ws_url: str, ref: int, backend_id: int) -> None:
+async def click(page: cdp.Page, ref: int, backend_id: int) -> None:
     """Click the node at its centre with a real press/release pair."""
-    x, y = await resolve_box(ws_url, ref, backend_id)
+    x, y = await resolve_box(page, ref, backend_id)
     for event_type in ("mousePressed", "mouseReleased"):
-        await cdp.send(ws_url, "Input.dispatchMouseEvent", {
+        await cdp.send(page, "Input.dispatchMouseEvent", {
             "type": event_type, "x": x, "y": y,
             "button": "left", "clickCount": 1,
         })
@@ -75,38 +75,47 @@ function (wanted) {
 _READ_CHECKED = "function () { return Boolean(this.checked); }"
 
 
-async def _call_on_node(ws_url: str, ref: int, backend_id: int,
+async def _call_on_node(page: cdp.Page, ref: int, backend_id: int,
                         declaration: str, arguments: list | None = None):
     """Run a function with the node as ``this`` and return its value."""
     try:
-        resolved = await cdp.send(ws_url, "DOM.resolveNode",
+        resolved = await cdp.send(page, "DOM.resolveNode",
                                   {"backendNodeId": backend_id})
-        result = await cdp.send(ws_url, "Runtime.callFunctionOn", {
-            "objectId": resolved["object"]["objectId"],
-            "functionDeclaration": declaration,
-            "arguments": arguments or [],
-            "returnByValue": True,
-        })
+        object_id = resolved["object"]["objectId"]
+        try:
+            result = await cdp.send(page, "Runtime.callFunctionOn", {
+                "objectId": object_id,
+                "functionDeclaration": declaration,
+                "arguments": arguments or [],
+                "returnByValue": True,
+            })
+        finally:
+            # The session outlives this command, so the object would leak.
+            try:
+                await cdp.send(page, "Runtime.releaseObject",
+                               {"objectId": object_id})
+            except Exception:
+                pass
     except cdp.CDPError as exc:
         raise ActionError(f"ref {ref} is stale; take a new snapshot ({exc})")
     return result.get("result", {}).get("value")
 
 
-async def type_text(ws_url: str, ref: int, backend_id: int, text: str,
+async def type_text(page: cdp.Page, ref: int, backend_id: int, text: str,
                     clear: bool = False) -> None:
     """Focus the field by clicking it, optionally clear it, then insert ``text``."""
-    await click(ws_url, ref, backend_id)
+    await click(page, ref, backend_id)
     if clear:
         for event_type in ("keyDown", "keyUp"):
-            await cdp.send(ws_url, "Input.dispatchKeyEvent", {
+            await cdp.send(page, "Input.dispatchKeyEvent", {
                 "type": event_type, "key": "a", "code": "KeyA",
                 "windowsVirtualKeyCode": 65, "modifiers": 2,
                 "commands": ["selectAll"],
             })
-    await cdp.send(ws_url, "Input.insertText", {"text": text})
+    await cdp.send(page, "Input.insertText", {"text": text})
 
 
-async def press(ws_url: str, key: str) -> None:
+async def press(page: cdp.Page, key: str) -> None:
     """Send one key press to whatever currently has focus."""
     if key not in _KEYS:
         raise ActionError(
@@ -115,46 +124,46 @@ async def press(ws_url: str, key: str) -> None:
     code, text = _KEYS[key]
     key_value = text if len(text) == 1 else key
     for event_type in ("keyDown", "keyUp"):
-        await cdp.send(ws_url, "Input.dispatchKeyEvent", {
+        await cdp.send(page, "Input.dispatchKeyEvent", {
             "type": event_type, "key": key_value, "code": key,
             "windowsVirtualKeyCode": code, "nativeVirtualKeyCode": code,
             "text": text if event_type == "keyDown" and len(text) == 1 else "",
         })
 
 
-async def select(ws_url: str, ref: int, backend_id: int, value: str) -> None:
+async def select(page: cdp.Page, ref: int, backend_id: int, value: str) -> None:
     """Pick an option by value or visible text, firing ``input`` and ``change``.
 
     A ``<select>`` cannot be driven by clicking: the popup is browser chrome, not
     page content, so the value is set programmatically and the events a page
     listens for are dispatched explicitly.
     """
-    ok = await _call_on_node(ws_url, ref, backend_id, _SET_SELECT_VALUE,
+    ok = await _call_on_node(page, ref, backend_id, _SET_SELECT_VALUE,
                              [{"value": value}])
     if not ok:
         raise ActionError(f"ref {ref} has no option matching {value!r}")
 
 
-async def set_checked(ws_url: str, ref: int, backend_id: int,
+async def set_checked(page: cdp.Page, ref: int, backend_id: int,
                       target: bool) -> bool:
     """Bring a checkbox or radio to ``target``. Returns whether it clicked.
 
     The current state is read first because a blind click toggles, which would
     make the same batch behave differently depending on the page's state.
     """
-    current = bool(await _call_on_node(ws_url, ref, backend_id, _READ_CHECKED))
+    current = bool(await _call_on_node(page, ref, backend_id, _READ_CHECKED))
     if current == target:
         return False
-    await click(ws_url, ref, backend_id)
+    await click(page, ref, backend_id)
     return True
 
 
-async def scroll(ws_url: str, ref: int | None, backend_id: int | None,
+async def scroll(page: cdp.Page, ref: int | None, backend_id: int | None,
                  to: str | None) -> None:
     """Scroll a ref into view, or the page to its top or bottom."""
     if backend_id is not None:
         try:
-            await cdp.send(ws_url, "DOM.scrollIntoViewIfNeeded",
+            await cdp.send(page, "DOM.scrollIntoViewIfNeeded",
                            {"backendNodeId": backend_id})
         except cdp.CDPError as exc:
             raise ActionError(f"ref {ref} is stale; take a new snapshot ({exc})")
@@ -162,22 +171,22 @@ async def scroll(ws_url: str, ref: int | None, backend_id: int | None,
     if to not in ("top", "bottom"):
         raise ActionError('scroll target must be a ref, or to "top" or "bottom"')
     delta = 20000 if to == "bottom" else -20000
-    await cdp.send(ws_url, "Input.dispatchMouseEvent", {
+    await cdp.send(page, "Input.dispatchMouseEvent", {
         "type": "mouseWheel", "x": 10, "y": 10, "deltaX": 0, "deltaY": delta,
     })
 
 
-async def hover(ws_url: str, ref: int, backend_id: int) -> None:
+async def hover(page: cdp.Page, ref: int, backend_id: int) -> None:
     """Move the pointer over the node, for menus that open on hover."""
-    x, y = await resolve_box(ws_url, ref, backend_id)
-    await cdp.send(ws_url, "Input.dispatchMouseEvent",
+    x, y = await resolve_box(page, ref, backend_id)
+    await cdp.send(page, "Input.dispatchMouseEvent",
                    {"type": "mouseMoved", "x": x, "y": y})
 
 
 _POLL_INTERVAL = 0.15
 
 
-async def settle(ws_url: str, timeout: float = 2.0) -> None:
+async def settle(page: cdp.Page, timeout: float = 2.0) -> None:
     """Wait until the document reports ``complete``, or give up quietly.
 
     Deliberately never raises: a page that keeps a request open forever should
@@ -187,7 +196,7 @@ async def settle(ws_url: str, timeout: float = 2.0) -> None:
     deadline = time.monotonic() + timeout
     while True:
         try:
-            result = await cdp.send(ws_url, "Runtime.evaluate", {
+            result = await cdp.send(page, "Runtime.evaluate", {
                 "expression": "document.readyState", "returnByValue": True,
             })
             if result.get("result", {}).get("value") == "complete":
@@ -199,7 +208,7 @@ async def settle(ws_url: str, timeout: float = 2.0) -> None:
         await asyncio.sleep(_POLL_INTERVAL)
 
 
-async def wait_for(ws_url: str, text: str | None, ref_gone: int | None,
+async def wait_for(page: cdp.Page, text: str | None, ref_gone: int | None,
                    backend_id: int | None, timeout: float = 5.0) -> None:
     """Poll until ``text`` appears on the page, or the node behind a ref is gone."""
     if text is None and ref_gone is None:
@@ -213,7 +222,7 @@ async def wait_for(ws_url: str, text: str | None, ref_gone: int | None,
     while True:
         if expression is not None:
             try:
-                result = await cdp.send(ws_url, "Runtime.evaluate", {
+                result = await cdp.send(page, "Runtime.evaluate", {
                     "expression": expression, "returnByValue": True,
                 })
                 if result.get("result", {}).get("value"):
@@ -222,7 +231,7 @@ async def wait_for(ws_url: str, text: str | None, ref_gone: int | None,
                 pass
         else:
             try:
-                await cdp.send(ws_url, "DOM.getBoxModel",
+                await cdp.send(page, "DOM.getBoxModel",
                                {"backendNodeId": backend_id})
             except cdp.CDPError:
                 return
