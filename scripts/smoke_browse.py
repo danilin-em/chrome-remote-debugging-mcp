@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import pathlib
 import re
 import sys
@@ -44,8 +45,12 @@ async def main() -> None:
         print("click Allow in Chrome", file=sys.stderr)
     else:
         b = cdp.Browser(lambda: cdp.browser_ws_url(args.cdp_url))
+    # One connection per autoconnect run: a dropped socket must fail the next
+    # call, not reconnect (a second Allow dialog).
+    scope = cdp.call_scope() if ac is not None else contextlib.nullcontext()
     try:
-        await _run(b, args)
+        with scope:
+            await _run(b, args)
     except autoconnect.AutoConnectError as exc:
         sys.exit(str(exc))
     finally:
@@ -61,7 +66,9 @@ async def _run(b: cdp.Browser, args: argparse.Namespace) -> None:
         try:
             await _drive(b, args, tab_id)
         finally:
-            await b.call("Target.closeTarget", {"targetId": tab_id})
+            # Best effort: never mask the run's own error with a cleanup failure.
+            with contextlib.suppress(Exception):
+                await b.call("Target.closeTarget", {"targetId": tab_id})
         return
     infos = (await b.call("Target.getTargets"))["targetInfos"]
     info = next((t for t in infos if t.get("type") == "page"), None)
