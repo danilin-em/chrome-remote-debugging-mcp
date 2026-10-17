@@ -30,18 +30,36 @@ async def main() -> None:
     parser.add_argument("--click-text", default="More")
     args = parser.parse_args()
 
-    targets = await cdp.list_targets(args.cdp_url)
-    page = next((t for t in targets if t.get("type") == "page"), None)
-    if page is None:
-        sys.exit(f"no page target found at {args.cdp_url}")
-    ws_url = page["webSocketDebuggerUrl"]
-    tab_id = page["id"]
+    b = cdp.Browser(lambda: cdp.browser_ws_url(args.cdp_url))
+    try:
+        await _run(b, args)
+    finally:
+        await b.close()
 
-    await cdp.send(ws_url, "Page.navigate", {"url": args.url})
-    await actions.settle(ws_url, timeout=10.0)
+
+async def _run(b: cdp.Browser, args: argparse.Namespace) -> None:
+    infos = (await b.call("Target.getTargets"))["targetInfos"]
+    info = next((t for t in infos if t.get("type") == "page"), None)
+    if info is None:
+        sys.exit(f"no page target found at {args.cdp_url}")
+    tab_id = info["targetId"]
+    page = cdp.Page(b, tab_id)
+
+    await cdp.send(page, "Page.navigate", {"url": args.url})
+    await actions.settle(page, timeout=10.0)
     await asyncio.sleep(2)
 
-    view, refs, _ = await browse.snapshot(ws_url, tab_id)
+    r = await cdp.send(page, "Runtime.evaluate", {"expression": "document.body"})
+    oid = r["result"]["objectId"]
+    v = await cdp.send(page, "Runtime.callFunctionOn", {
+        "objectId": oid,
+        "functionDeclaration": "function () { return this.tagName; }",
+        "returnByValue": True,
+    })
+    assert v["result"]["value"] == "BODY"
+    print("objectId across commands: ok")
+
+    view, refs, _ = await browse.snapshot(page, tab_id)
     print(f"view: {len(view.splitlines())} lines, ~{len(view) // 4} tokens, {refs} refs")
     print("\n".join(view.splitlines()[:12]))
 
@@ -55,11 +73,11 @@ async def main() -> None:
     ref = int(wanted.strip().split("#")[1].split()[0])
     print(f"\nclicking {wanted.strip()}")
 
-    steps, error = await browse.run_actions(ws_url, tab_id, [{"do": "click", "ref": ref}])
+    steps, error = await browse.run_actions(page, tab_id, [{"do": "click", "ref": ref}])
     print("steps:", steps, "error:", error)
     await asyncio.sleep(2)
 
-    view2, refs2, _ = await browse.snapshot(ws_url, tab_id)
+    view2, refs2, _ = await browse.snapshot(page, tab_id)
     print(f"after: {len(view2.splitlines())} lines, {refs2} refs")
     print(view2.splitlines()[0])
 

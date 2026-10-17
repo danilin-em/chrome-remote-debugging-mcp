@@ -46,10 +46,10 @@ def trim(nodes: list[dict]) -> list[dict]:
     return out
 
 
-async def capture(cdp_url: str, ws_url: str, url: str, wait: float) -> list[dict]:
-    await cdp.send(ws_url, "Page.navigate", {"url": url})
+async def capture(cdp_url: str, page: cdp.Page, url: str, wait: float) -> list[dict]:
+    await cdp.send(page, "Page.navigate", {"url": url})
     await asyncio.sleep(wait)
-    tree = await cdp.send(ws_url, "Page.getFrameTree")
+    tree = await cdp.send(page, "Page.getFrameTree")
     frames: list[str] = []
 
     def walk(frame: dict) -> None:
@@ -60,7 +60,7 @@ async def capture(cdp_url: str, ws_url: str, url: str, wait: float) -> list[dict
     walk(tree["frameTree"])
     out = []
     for frame_id in frames:
-        ax = await cdp.send(ws_url, "Accessibility.getFullAXTree", {"frameId": frame_id})
+        ax = await cdp.send(page, "Accessibility.getFullAXTree", {"frameId": frame_id})
         out.append({"frameId": frame_id, "nodes": ax["nodes"]})
     return out
 
@@ -79,30 +79,34 @@ async def main() -> None:
     parser.add_argument("--cdp-url", default="http://127.0.0.1:9223")
     args = parser.parse_args()
 
-    targets = await cdp.list_targets(args.cdp_url)
-    page = next(t for t in targets if t.get("type") == "page")
-    ws_url = page["webSocketDebuggerUrl"]
+    b = cdp.Browser(lambda: cdp.browser_ws_url(args.cdp_url))
+    try:
+        infos = (await b.call("Target.getTargets"))["targetInfos"]
+        info = next(t for t in infos if t.get("type") == "page")
+        page = cdp.Page(b, info["targetId"])
 
-    FIXTURES.mkdir(parents=True, exist_ok=True)
-    for name, url, wait, compress in PAGES:
-        frames = await capture(args.cdp_url, ws_url, url, wait)
-        if name == "probe":
-            # Kept raw and uncompressed: small, and the only fixture that still
-            # carries name.sources, which test_raw_probe_still_carries_name_sources
-            # needs.
-            (FIXTURES / "probe_raw.json").write_text(
-                json.dumps(frames, ensure_ascii=False), encoding="utf-8"
-            )
-        for frame in frames:
-            frame["nodes"] = trim(frame["nodes"])
-        blob = json.dumps(frames, ensure_ascii=False)
-        if compress:
-            with gzip.open(FIXTURES / f"{name}.json.gz", "wt", encoding="utf-8") as fh:
-                fh.write(blob)
-        else:
-            (FIXTURES / f"{name}.json").write_text(blob, encoding="utf-8")
-        print(f"{name}: {len(frames)} frame(s), "
-              f"{sum(len(f['nodes']) for f in frames)} nodes")
+        FIXTURES.mkdir(parents=True, exist_ok=True)
+        for name, url, wait, compress in PAGES:
+            frames = await capture(args.cdp_url, page, url, wait)
+            if name == "probe":
+                # Kept raw and uncompressed: small, and the only fixture that still
+                # carries name.sources, which test_raw_probe_still_carries_name_sources
+                # needs.
+                (FIXTURES / "probe_raw.json").write_text(
+                    json.dumps(frames, ensure_ascii=False), encoding="utf-8"
+                )
+            for frame in frames:
+                frame["nodes"] = trim(frame["nodes"])
+            blob = json.dumps(frames, ensure_ascii=False)
+            if compress:
+                with gzip.open(FIXTURES / f"{name}.json.gz", "wt", encoding="utf-8") as fh:
+                    fh.write(blob)
+            else:
+                (FIXTURES / f"{name}.json").write_text(blob, encoding="utf-8")
+            print(f"{name}: {len(frames)} frame(s), "
+                  f"{sum(len(f['nodes']) for f in frames)} nodes")
+    finally:
+        await b.close()
 
 
 if __name__ == "__main__":
