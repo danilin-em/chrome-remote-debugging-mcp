@@ -219,7 +219,10 @@ class Browser:
         ``asyncio.shield``, so a cancelled caller does not cancel the attach
         the others are waiting on. Raises :class:`TargetDetached` if Chrome
         refuses the attach (the tab is gone); nothing is cached then.
+        The caller's own connection is checked first (see :func:`call_scope`),
+        so it never inherits a failure of the scope that started the attach.
         """
+        await self._connection()
         session_id = self._sessions.get(target_id)
         if session_id is not None:
             return session_id

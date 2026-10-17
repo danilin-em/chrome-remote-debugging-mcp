@@ -993,6 +993,32 @@ def test_a_failure_a_waiter_received_is_not_kept(monkeypatch):
     assert len(hook.calls) == 2
 
 
+def test_joining_an_attach_does_not_inherit_a_stale_scope(monkeypatch):
+    # Call A's scope saw its socket die; call B is fresh. A asks for the
+    # session first, so B must not join an attach that fails on A's scope.
+    first, second = FakeBrowserWS(_tabs), FakeBrowserWS(_tabs)
+    connects = _patch_connect(monkeypatch, first, second)
+    b = cdp.Browser(_provider("ws://x"))
+    page = cdp.Page(b, "T1")
+
+    async def fresh():
+        with cdp.call_scope():
+            return await cdp.send(page, "B.b")
+
+    async def scenario():
+        with cdp.call_scope():
+            await b.call("A.a")
+            first.drop()
+            await _settle()
+            return await asyncio.gather(cdp.send(page, "A.b"), fresh(),
+                                        return_exceptions=True)
+
+    stale, result = asyncio.run(scenario())
+    assert isinstance(stale, cdp.CDPDisconnected)
+    assert result == {"echo": "B.b"}
+    assert len(connects) == 2
+
+
 def test_concurrent_scoped_calls_share_one_attempt(monkeypatch):
     monkeypatch.setattr(cdp, "_ids", itertools.count(1))
     hook = _gated_hook()
