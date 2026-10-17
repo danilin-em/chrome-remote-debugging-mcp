@@ -224,7 +224,9 @@ def test_connect_403_explains_allow(monkeypatch, target, where):
     with pytest.raises(AutoConnectError) as e:
         asyncio.run(AutoConnect(target, "/d", None).connect("ws://x"))
     assert f"Chrome{where} refused the debugging connection (HTTP 403)" in str(e.value)
-    assert "Allow" in str(e.value)
+    assert str(e.value).endswith(
+        "enable remote debugging in chrome://inspect/#remote-debugging, then call the "
+        'tool again; that call makes Chrome show an "Allow" dialog for the user to click')
     assert isinstance(e.value.__cause__, websockets.InvalidStatus)
 
 
@@ -238,6 +240,8 @@ def test_connect_dead_port_is_not_debuggable(monkeypatch, exc):
     with pytest.raises(AutoConnectError) as e:
         asyncio.run(AutoConnect(None, "/d", None).connect("ws://x"))
     assert "is not accepting debugging connections" in str(e.value)
+    assert ('chrome://inspect/#remote-debugging, then call the tool again; that call makes '
+            'Chrome show an "Allow" dialog for the user to click (') in str(e.value)
     assert type(exc).__name__ in str(e.value)
     assert e.value.__cause__ is exc
 

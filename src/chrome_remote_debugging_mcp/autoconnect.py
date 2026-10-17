@@ -28,6 +28,9 @@ ALLOW_WAIT = 45.0
 SSH_READ_TIMEOUT = 15.0
 
 _FILE = "DevToolsActivePort"
+# What happens after the user enables debugging: the dialog appears only then.
+_NEXT_STEP = (', then call the tool again; that call makes Chrome show an "Allow" '
+              "dialog for the user to click")
 
 
 class AutoConnectError(ConnectionError):
@@ -65,7 +68,8 @@ class AutoConnect:
     def not_debuggable(self, detail: str) -> str:
         return (
             f"Chrome{self._where} is not accepting debugging connections: ask the user to "
-            f"enable remote debugging in chrome://inspect/#remote-debugging ({detail})"
+            f"enable remote debugging in chrome://inspect/#remote-debugging{_NEXT_STEP} "
+            f"({detail})"
         )
 
     @property
@@ -92,8 +96,8 @@ class AutoConnect:
                 raise AutoConnectError(
                     f"Chrome{self._where} refused the debugging connection (HTTP 403): "
                     "the Allow dialog was declined or remote debugging is off. Ask the "
-                    "user to enable remote debugging in chrome://inspect/#remote-debugging "
-                    "and click Allow, then call the tool again"
+                    "user to enable remote debugging in chrome://inspect/#remote-debugging"
+                    + _NEXT_STEP
                 ) from exc
             raise AutoConnectError(self.not_debuggable(f"{type(exc).__name__}: {exc}")) from exc
         except (websockets.InvalidHandshake, OSError, EOFError) as exc:

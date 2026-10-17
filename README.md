@@ -218,13 +218,15 @@ click it. That is once per server process: the connection then stays open.
 
 - **Debugging is off.** The tool returns "Chrome is not accepting debugging
   connections: ask the user to enable remote debugging in
-  chrome://inspect/#remote-debugging". Switch it on and call again.
+  chrome://inspect/#remote-debugging, then call the tool again; that call makes
+  Chrome show an "Allow" dialog for the user to click". Switch it on, call
+  again and click **Allow** in the dialog that call opens.
 - **"has not accepted the debugging connection within 45s".** Chrome is
   waiting for you to click **Allow**. Click it and call the tool again; the
   pending connection is kept, so no second dialog appears.
 - **"refused the debugging connection (HTTP 403)".** You clicked Deny, or
-  debugging is off. Enable it in `chrome://inspect/#remote-debugging` and click
-  Allow when the dialog shows, then call the tool again.
+  debugging is off. Enable it in `chrome://inspect/#remote-debugging` and call
+  the tool again; that call opens a new Allow dialog — click it.
 - **The connection dropped mid-work** (Chrome restarted, debugging toggled).
   The next tool call reconnects and Chrome shows one new Allow dialog.
 
