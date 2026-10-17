@@ -68,8 +68,9 @@ async def browser_ws_url(cdp_url: str) -> str:
     """Return the browser-level websocket url for the Chrome at ``cdp_url``.
 
     Taken from ``GET {cdp_url}/json/version``, with its host and port replaced
-    by ``cdp_url``'s: behind an ssh forward Chrome reports its own (remote)
-    port, but the socket must be opened on the local forwarded one.
+    by ``cdp_url``'s. Defensive: whatever address Chrome reports, the socket
+    always goes through ``cdp_url``'s host:port (Chrome only accepts a
+    ``localhost``/``127.0.0.1`` Host header).
     """
     async with httpx.AsyncClient() as client:
         resp = await client.get(f"{cdp_url}/json/version", timeout=10.0)
@@ -227,7 +228,7 @@ class Browser:
             while True:
                 message = json.loads(await ws.recv())
                 if message.get("method") == "Target.detachedFromTarget":
-                    self._detach(message["params"]["sessionId"])
+                    self._detach(message.get("params", {}).get("sessionId"))
                     continue
                 # Other events, and late replies whose caller gave up, match
                 # nothing.

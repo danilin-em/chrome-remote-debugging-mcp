@@ -75,6 +75,16 @@ function (wanted) {
 _READ_CHECKED = "function () { return Boolean(this.checked); }"
 
 
+async def _release(page: cdp.Page, object_id: str) -> None:
+    """Free a resolved object; the session outlives the command, so it would
+    leak. Callers skip it after a transport failure (the object is gone with
+    the session). Release errors are never reported."""
+    try:
+        await cdp.send(page, "Runtime.releaseObject", {"objectId": object_id})
+    except Exception:
+        pass
+
+
 async def _call_on_node(page: cdp.Page, ref: int, backend_id: int,
                         declaration: str, arguments: list | None = None):
     """Run a function with the node as ``this`` and return its value."""
@@ -89,13 +99,10 @@ async def _call_on_node(page: cdp.Page, ref: int, backend_id: int,
                 "arguments": arguments or [],
                 "returnByValue": True,
             })
-        finally:
-            # The session outlives this command, so the object would leak.
-            try:
-                await cdp.send(page, "Runtime.releaseObject",
-                               {"objectId": object_id})
-            except Exception:
-                pass
+        except cdp.CDPError:
+            await _release(page, object_id)
+            raise
+        await _release(page, object_id)
     except cdp.CDPError as exc:
         raise ActionError(f"ref {ref} is stale; take a new snapshot ({exc})")
     return result.get("result", {}).get("value")

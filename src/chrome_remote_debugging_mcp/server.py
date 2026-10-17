@@ -82,7 +82,7 @@ async def _ensure_chrome() -> None:
     """Make sure the auto-launched Chrome is up; no-op without CHROME_LAUNCH.
 
     Rewrites ``CDP_URL`` on every call: a relaunch (the user closed the
-    window) lands on a new port, and tools read ``CDP_URL`` at call time.
+    window) lands on a new port, and the persistent connection reads ``CDP_URL`` when it (re)connects.
     Runs in a worker thread because a launch blocks for up to the startup
     timeout. Raises ``RuntimeError`` on failure; callers already turn any
     exception here into an ``{"error": ...}`` payload.
@@ -144,9 +144,9 @@ async def _open_target() -> tuple[dict, cdp.Page]:
         await _ensure_tunnel()
         await _ensure_chrome()
         result = await _browser().call("Target.createTarget", {"url": "about:blank"})
+        tab_id = result["targetId"]
     except Exception as exc:
         raise _TargetError(f"cannot open a new tab at {CDP_URL}: {exc}")
-    tab_id = result["targetId"]
     target = {"id": tab_id, "type": "page", "title": "", "url": "about:blank"}
     return target, cdp.Page(_browser(), tab_id)
 
@@ -427,8 +427,8 @@ def main() -> None:
 
     When ``SSH_PROXY_TO`` is set, open an ``ssh -L`` tunnel to the CDP endpoint
     first and repoint ``CDP_URL`` at the forwarded local port, so every tool
-    (which reads ``CDP_URL`` at call time) transparently egresses through the
-    remote host. The tunnel lives exactly as long as the server; if ssh dies
+    (the persistent browser connection reads ``CDP_URL`` whenever it
+    (re)connects) transparently egresses through the remote host. The tunnel lives exactly as long as the server; if ssh dies
     in between, the next tool call respawns it on the same port.
 
     When ``CHROME_LAUNCH`` is set, create a :class:`ChromeLauncher` but do not

@@ -204,6 +204,15 @@ def test_call_on_node_releases_the_resolved_object(monkeypatch):
     assert ("Runtime.releaseObject", {"objectId": "O1"}) in rec.calls
 
 
+def test_call_on_node_does_not_release_after_a_transport_failure(monkeypatch):
+    rec = Recorder(replies={"DOM.resolveNode": {"object": {"objectId": "O1"}}},
+                   errors={"Runtime.callFunctionOn": cdp.CDPDisconnected("gone")})
+    _install(monkeypatch, rec)
+    with pytest.raises(cdp.CDPDisconnected):
+        asyncio.run(actions.select(WS, 4, 77, "два"))
+    assert "Runtime.releaseObject" not in rec.methods()
+
+
 def test_call_on_node_release_failure_is_ignored(monkeypatch):
     rec = Recorder(replies={
         "DOM.resolveNode": {"object": {"objectId": "O1"}},

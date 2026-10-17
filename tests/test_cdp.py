@@ -553,6 +553,21 @@ def test_detach_event_for_unknown_session_is_ignored(monkeypatch):
     assert fake.sent[-1]["sessionId"] == "S-T1"
 
 
+def test_detach_event_without_a_session_id_is_ignored(monkeypatch):
+    fake = FakeBrowserWS(_tabs)
+    _patch_connect(monkeypatch, fake)
+    page = cdp.Page(cdp.Browser(_provider("ws://x")), "T1")
+
+    async def scenario():
+        await cdp.send(page, "A.a")
+        fake.push({"method": "Target.detachedFromTarget"})
+        await _settle()
+        return await cdp.send(page, "B.b")
+
+    assert asyncio.run(scenario()) == {"echo": "B.b"}
+    assert len(_attaches(fake)) == 1
+
+
 def test_session_not_found_error_becomes_target_detached(monkeypatch):
     def handler(frame):
         if frame["method"] == "Gone.method":

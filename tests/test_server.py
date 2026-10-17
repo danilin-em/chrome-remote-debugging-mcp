@@ -245,6 +245,16 @@ def test_open_target_uses_create_target(monkeypatch):
     assert out["tab_id"] == "NEW"
 
 
+def test_open_target_malformed_reply_becomes_an_error(monkeypatch):
+    class Bare(FakeBrowser):
+        async def call(self, method, params=None, **kw):
+            return {}
+
+    monkeypatch.setattr(server, "_browser", lambda: Bare([]))
+    out = asyncio.run(_fn(server.navigate)("https://example.com"))
+    assert out["error"].startswith("cannot open a new tab at")
+
+
 def test_close_tab_uses_close_target(monkeypatch):
     fake = _stub(monkeypatch, targets=[PAGE])
     out = asyncio.run(_fn(server.close_tab)("T1"))
