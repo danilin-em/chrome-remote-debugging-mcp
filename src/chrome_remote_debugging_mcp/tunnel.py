@@ -28,6 +28,18 @@ import threading
 import time
 
 
+# ssh options shared by the tunnel and the one-shot ``ssh cat`` reads (autoconnect).
+# BatchMode=yes: fail fast instead of hanging on a password prompt
+#   (key-based auth is required for unattended use).
+# ServerAlive*: detect a dropped connection and let ssh tear down.
+SSH_OPTIONS: tuple[str, ...] = (
+    "-o", "BatchMode=yes",
+    "-o", "ServerAliveInterval=30",
+    "-o", "ServerAliveCountMax=3",
+    "-o", "StrictHostKeyChecking=accept-new",
+)
+
+
 def _pick_free_port() -> int:
     """Ask the OS for an unused loopback TCP port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -79,20 +91,15 @@ class SshLocalForwardTunnel:
         return f"http://127.0.0.1:{self.local_port}"
 
     def _build_cmd(self) -> list[str]:
-        # BatchMode=yes: fail fast instead of hanging on a password prompt
-        #   (key-based auth is required for an unattended tunnel).
         # ExitOnForwardFailure=yes: if the local -L bind fails, ssh exits so we
         #   surface the error rather than a silently-dead forward.
-        # ServerAlive*: detect a dropped connection and let ssh tear down.
         return [
             "ssh",
             "-N",
             "-T",
-            "-o", "BatchMode=yes",
+            *SSH_OPTIONS[:2],
             "-o", "ExitOnForwardFailure=yes",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=3",
-            "-o", "StrictHostKeyChecking=accept-new",
+            *SSH_OPTIONS[2:],
             "-L", f"127.0.0.1:{self.local_port}:{self.remote_host}:{self.remote_port}",
             self.target,
         ]
