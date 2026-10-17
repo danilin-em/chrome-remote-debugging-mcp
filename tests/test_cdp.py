@@ -691,10 +691,11 @@ def test_abandoned_connect_failure_is_retrieved(monkeypatch):
     # "Task exception was never retrieved" behind.
     release = {}
     contexts = []
+    err = OSError("refused")
 
     async def fake_connect(url, **kw):
         await release["event"].wait()
-        raise OSError("refused")
+        raise err
 
     monkeypatch.setattr(cdp.websockets, "connect", fake_connect)
     b = cdp.Browser(_provider("ws://x"))
@@ -712,7 +713,10 @@ def test_abandoned_connect_failure_is_retrieved(monkeypatch):
         gc.collect()
 
     asyncio.run(scenario())
-    assert not [c for c in contexts if "never retrieved" in c.get("message", "")]
+    assert not [c for c in contexts
+                if c.get("exception") is err
+                or "never retrieved" in c.get("message", "")
+                or "shielded future" in c.get("message", "")]
 
 
 def test_send_reattaches_when_session_died_before_the_command(monkeypatch):

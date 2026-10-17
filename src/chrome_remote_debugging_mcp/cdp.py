@@ -203,9 +203,9 @@ class Browser:
     async def _connection(self):
         """Return the live socket, connecting first if there is none.
 
-        Concurrent callers share one connect attempt. They wait on it through
-        ``asyncio.shield``, so a cancelled caller does not cancel the attempt
-        the others are waiting on.
+        Concurrent callers share one connect attempt. They wait on it with
+        ``asyncio.wait``, which a cancelled caller abandons without cancelling
+        the attempt the others are waiting on.
         """
         if self._ws is not None:
             return self._ws
@@ -215,7 +215,9 @@ class Browser:
             # asyncio does not log "Task exception was never retrieved".
             self._connecting.add_done_callback(
                 lambda t: t.cancelled() or t.exception())
-        return await asyncio.shield(self._connecting)
+        connecting = self._connecting
+        await asyncio.wait({connecting})
+        return connecting.result()
 
     async def _connect(self):
         try:
