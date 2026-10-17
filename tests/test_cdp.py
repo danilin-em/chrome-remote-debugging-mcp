@@ -1,6 +1,7 @@
 """Unit tests for the thin CDP client — no real Chrome, no network."""
 
 import asyncio
+import gc
 import itertools
 import json
 
@@ -683,3 +684,52 @@ def test_send_passes_timeout(monkeypatch):
 
     with pytest.raises(cdp.CDPTimeout, match=r"no response to X within 0\.01s"):
         asyncio.run(cdp.send(page, "X", timeout=0.01))
+
+
+def test_abandoned_connect_failure_is_retrieved(monkeypatch):
+    # A caller that gives up on a connect which later fails must not leave
+    # "Task exception was never retrieved" behind.
+    release = {}
+    contexts = []
+
+    async def fake_connect(url, **kw):
+        await release["event"].wait()
+        raise OSError("refused")
+
+    monkeypatch.setattr(cdp.websockets, "connect", fake_connect)
+    b = cdp.Browser(_provider("ws://x"))
+
+    async def scenario():
+        asyncio.get_running_loop().set_exception_handler(
+            lambda loop, context: contexts.append(context))
+        release["event"] = asyncio.Event()
+        try:
+            await asyncio.wait_for(b.call("Some.method"), 0.01)
+        except asyncio.TimeoutError:
+            pass
+        release["event"].set()
+        await _settle()
+        gc.collect()
+
+    asyncio.run(scenario())
+    assert not [c for c in contexts if "never retrieved" in c.get("message", "")]
+
+
+def test_send_reattaches_when_session_died_before_the_command(monkeypatch):
+    # The attach is answered and the socket dies at once: the session id the
+    # sender gets belongs to the dead connection, so send must attach again.
+    def dying(frame):
+        return [{"id": frame["id"], "result": {"sessionId": "S1"}}, CLOSE]
+
+    def second_handler(frame):
+        if frame["method"] == "Target.attachToTarget":
+            return [{"id": frame["id"], "result": {"sessionId": "S2"}}]
+        return _echo(frame)
+
+    first, second = FakeBrowserWS(dying), FakeBrowserWS(second_handler)
+    connects = _patch_connect(monkeypatch, first, second)
+    page = cdp.Page(cdp.Browser(_provider("ws://x")), "T1")
+
+    assert asyncio.run(cdp.send(page, "Runtime.evaluate")) == {"ok": "Runtime.evaluate"}
+    assert second.sent[-1]["sessionId"] == "S2"
+    assert len(connects) == 2

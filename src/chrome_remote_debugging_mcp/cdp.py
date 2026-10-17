@@ -211,6 +211,10 @@ class Browser:
             return self._ws
         if self._connecting is None:
             self._connecting = asyncio.ensure_future(self._connect())
+            # If every waiter gave up, nobody reads a failure: retrieve it so
+            # asyncio does not log "Task exception was never retrieved".
+            self._connecting.add_done_callback(
+                lambda t: t.cancelled() or t.exception())
         return await asyncio.shield(self._connecting)
 
     async def _connect(self):
@@ -265,5 +269,9 @@ async def send(page: Page, method: str, params: dict | None = None,
     the wait for this command's reply.
     """
     session_id = await page.browser.session(page.target_id)
+    if session_id not in page.browser._sessions.values():
+        # Attached on a connection that died before this command went out:
+        # attach again, on the new one.
+        session_id = await page.browser.session(page.target_id)
     return await page.browser.call(method, params, session_id=session_id,
                                    timeout=timeout)
