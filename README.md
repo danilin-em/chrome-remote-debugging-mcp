@@ -165,7 +165,7 @@ For a page whose content arrives after load — most single-page applications �
 |-----------|---------------------------|--------------------------------|
 | `CDP_URL` | `http://localhost:9222`   | Chrome remote-debugging origin |
 | `CHROME_LAUNCH` | unset (off)       | `1`/`true`/`yes`/`on` → start a local Chrome on first use instead of connecting to `CDP_URL`. Cannot be combined with `CDP_URL` or `SSH_PROXY_TO`. |
-| `CHROME_AUTOCONNECT` | unset (off) | `1`/`true`/`yes`/`on` → attach to your own running Chrome (see [Attach to your own Chrome](#attach-to-your-own-chrome-autoconnect)). Cannot be combined with `CDP_URL` or `CHROME_LAUNCH`; works with `SSH_PROXY_TO`. |
+| `CHROME_AUTOCONNECT` | unset (off) | `1`/`true`/`yes`/`on` → attach to your own running Chrome (see [Attach to your own Chrome](#attach-to-your-own-chrome-autoconnect)). Cannot be combined with `CDP_URL` or `CHROME_LAUNCH`; works with `SSH_PROXY_TO` (and honours `SSH_PROXY_PORT`). |
 | `CHROME_USER_DATA_DIR` | `~/.config/google-chrome` | Chrome profile directory holding `DevToolsActivePort`. Only used with `CHROME_AUTOCONNECT` (on the remote host when `SSH_PROXY_TO` is set). |
 | `MCP_DEBUG_LOG` | unset (off)         | Log every tool call — arguments, result, duration — to a file. `1`/`true`/`yes`/`on` → `/tmp/chrome-remote-debugging-mcp.log`; any other value is the log file path; `0`/`false`/`no`/`off` or empty → off. Read once at startup. |
 
