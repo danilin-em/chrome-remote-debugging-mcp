@@ -10,6 +10,7 @@ Run over stdio (the default transport) as a console script or via
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 from urllib.parse import urlparse
 
@@ -158,7 +159,17 @@ async def _target_or_new(tab_id: str | None) -> tuple[dict, cdp.Page]:
     return await _resolve_target(tab_id)
 
 
+def _scoped(fn):
+    """Run a tool inside :func:`cdp.call_scope`: one connection per call."""
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        with cdp.call_scope():
+            return await fn(*args, **kwargs)
+    return wrapper
+
+
 @mcp.tool()
+@_scoped
 async def ping() -> dict:
     """Check connectivity to Chrome's DevTools endpoint (``CDP_URL``).
 
@@ -181,6 +192,7 @@ async def ping() -> dict:
 
 
 @mcp.tool()
+@_scoped
 async def list_tabs() -> dict:
     """List open Chrome page tabs.
 
@@ -205,6 +217,7 @@ async def list_tabs() -> dict:
 
 
 @mcp.tool()
+@_scoped
 async def navigate(url: str, tab_id: str | None = None) -> dict:
     """Navigate a Chrome tab to ``url``.
 
@@ -228,6 +241,7 @@ async def navigate(url: str, tab_id: str | None = None) -> dict:
 
 
 @mcp.tool()
+@_scoped
 async def evaluate(expression: str, tab_id: str) -> dict:
     """Evaluate a JavaScript ``expression`` in a Chrome tab.
 
@@ -266,6 +280,7 @@ async def evaluate(expression: str, tab_id: str) -> dict:
 
 
 @mcp.tool()
+@_scoped
 async def cdp_command(method: str, tab_id: str, params: dict | None = None) -> dict:
     """Send a raw CDP command and return its raw result — escape hatch.
 
@@ -301,6 +316,7 @@ async def cdp_command(method: str, tab_id: str, params: dict | None = None) -> d
 
 
 @mcp.tool()
+@_scoped
 async def browse(url: str, tab_id: str | None = None) -> dict:
     """Open ``url`` and return a readable view of the page, with numbered refs.
 
@@ -333,6 +349,7 @@ async def browse(url: str, tab_id: str | None = None) -> dict:
 
 
 @mcp.tool()
+@_scoped
 async def browse_view(tab_id: str) -> dict:
     """Re-read the current page and return a fresh view with fresh refs.
 
@@ -351,6 +368,7 @@ async def browse_view(tab_id: str) -> dict:
 
 
 @mcp.tool()
+@_scoped
 async def browse_act(actions_list: list[dict], tab_id: str) -> dict:
     """Run several actions against the current view, then return one new view.
 
@@ -399,6 +417,7 @@ async def browse_act(actions_list: list[dict], tab_id: str) -> dict:
 
 
 @mcp.tool()
+@_scoped
 async def close_tab(tab_id: str) -> dict:
     """Close a Chrome tab opened earlier (e.g. by ``browse`` / ``navigate``).
 

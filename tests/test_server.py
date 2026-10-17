@@ -743,3 +743,24 @@ def test_main_without_chrome_launch_has_no_launcher(monkeypatch):
     monkeypatch.setattr(server.mcp, "run", lambda: seen.append(server._LAUNCHER))
     server.main()
     assert seen == [None]
+
+
+def test_tools_run_inside_a_call_scope(monkeypatch):
+    fake = _stub(monkeypatch, targets=[], version={})
+    seen = []
+    real_call = fake.call
+
+    async def call(method, params=None, **kw):
+        seen.append(server.cdp._scope.get() is not None)
+        return await real_call(method, params, **kw)
+
+    fake.call = call
+    asyncio.run(_fn(server.ping)())
+    assert seen and all(seen)
+
+
+def test_scoped_tools_keep_their_schema():
+    tools = asyncio.run(server.mcp.list_tools())
+    schema = next(t for t in tools if t.name == "navigate").inputSchema
+    assert set(schema["properties"]) == {"url", "tab_id"}
+    assert schema["required"] == ["url"]

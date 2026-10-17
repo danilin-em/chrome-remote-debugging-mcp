@@ -10,6 +10,8 @@ independently testable.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import itertools
 import json
 from collections.abc import Awaitable, Callable
@@ -62,6 +64,37 @@ class TargetDetached(Exception):
 
     Not a :class:`CDPError`, for the same reason as :class:`CDPTimeout`.
     """
+
+
+class _Scope:
+    """What one call scope has learned about the connection (see call_scope)."""
+
+    def __init__(self) -> None:
+        self.ws = None  # socket the scope is bound to
+        self.error: BaseException | None = None  # first connect failure
+
+
+# The active call scope, or None. A mutable object shared by every task the
+# scope's context is copied into (asyncio.gather and friends).
+_scope: contextvars.ContextVar[_Scope | None] = contextvars.ContextVar(
+    "cdp_scope", default=None)
+
+
+@contextlib.contextmanager
+def call_scope():
+    """Limit the code inside to one connection to Chrome.
+
+    Opening a connection can cost the user a permission prompt, and retry
+    loops that swallow errors would open one per attempt. Inside a scope the
+    first connect failure is re-raised for every later call, and a call after
+    the scope's socket died raises :class:`CDPDisconnected` instead of
+    reconnecting; only the next scope connects again.
+    """
+    token = _scope.set(_Scope())
+    try:
+        yield
+    finally:
+        _scope.reset(token)
 
 
 async def browser_ws_url(cdp_url: str) -> str:
@@ -205,8 +238,27 @@ class Browser:
 
         Concurrent callers share one connect attempt. They wait on it with
         ``asyncio.wait``, which a cancelled caller abandons without cancelling
-        the attempt the others are waiting on.
+        the attempt the others are waiting on. Inside a :func:`call_scope`
+        it connects at most once (see there).
         """
+        scope = _scope.get()
+        if scope is None:
+            return await self._open()
+        if scope.error is not None:
+            raise scope.error
+        if scope.ws is not None:
+            if self._ws is not scope.ws:
+                raise CDPDisconnected("the connection to Chrome was lost during "
+                                      "this tool call; call the tool again")
+            return scope.ws
+        try:
+            scope.ws = await self._open()
+        except Exception as exc:
+            scope.error = exc
+            raise
+        return scope.ws
+
+    async def _open(self):
         if self._ws is not None:
             return self._ws
         if self._connecting is None:

@@ -737,3 +737,99 @@ def test_send_reattaches_when_session_died_before_the_command(monkeypatch):
     assert asyncio.run(cdp.send(page, "Runtime.evaluate")) == {"ok": "Runtime.evaluate"}
     assert second.sent[-1]["sessionId"] == "S2"
     assert len(connects) == 2
+
+
+# --- call_scope: at most one connection per tool call -----------------------
+
+def test_scope_does_not_reconnect_after_a_failed_connect(monkeypatch):
+    refused = OSError("refused")
+    connects = _patch_connect(monkeypatch, refused, FakeBrowserWS(_echo))
+    b = cdp.Browser(_provider("ws://x"))
+
+    async def failing_call():
+        with pytest.raises(OSError) as info:
+            await b.call("A.a")
+        return info.value
+
+    async def scenario():
+        with cdp.call_scope():
+            first = await failing_call()
+            second = await failing_call()
+        with cdp.call_scope():
+            result = await b.call("A.a")
+        return first, second, result
+
+    first, second, result = asyncio.run(scenario())
+    assert first is refused and second is refused
+    assert result == {"ok": "A.a"}
+    assert len(connects) == 2
+
+
+def test_scope_does_not_reconnect_after_the_connection_drops(monkeypatch):
+    fake = FakeBrowserWS(_echo)
+    connects = _patch_connect(monkeypatch, fake, FakeBrowserWS(_echo))
+    b = cdp.Browser(_provider("ws://x"))
+
+    async def scenario():
+        with cdp.call_scope():
+            await b.call("A.a")
+            await b.call("A.again")  # a live bound socket is reused
+            fake.drop()
+            await _settle()
+            with pytest.raises(cdp.CDPDisconnected, match="during this tool call"):
+                await b.call("A.b")
+
+    asyncio.run(scenario())
+    assert len(connects) == 1
+
+
+def test_scope_counts_a_joined_attempt_that_failed(monkeypatch):
+    refused = OSError("refused")
+    connects = []
+
+    async def fake_connect(url, **kw):
+        connects.append(url)
+        await asyncio.sleep(0)
+        raise refused
+
+    monkeypatch.setattr(cdp.websockets, "connect", fake_connect)
+    b = cdp.Browser(_provider("ws://x"))
+
+    async def scenario():
+        with cdp.call_scope():
+            results = await asyncio.gather(b.call("A.a"), b.call("B.b"),
+                                           return_exceptions=True)
+            with pytest.raises(OSError) as info:
+                await b.call("C.c")
+        return results, info.value
+
+    results, third = asyncio.run(scenario())
+    assert results == [refused, refused]
+    assert third is refused
+    assert len(connects) == 1
+
+
+def test_scope_stops_a_swallowing_retry_loop_from_reconnecting(monkeypatch):
+    from chrome_remote_debugging_mcp import actions
+
+    def handler(frame):
+        if frame["method"] == "Target.attachToTarget":
+            return [{"id": frame["id"], "result": {"sessionId": "S1"}}]
+        return _echo(frame)
+
+    fake = FakeBrowserWS(handler)
+    connects = _patch_connect(monkeypatch, fake, FakeBrowserWS(handler))
+    b = cdp.Browser(_provider("ws://x"))
+
+    async def scenario():
+        with cdp.call_scope():
+            await b.call("A.a")
+            fake.drop()
+            await _settle()
+            with pytest.raises(actions.ActionError, match="timed out"):
+                await actions.wait_for(cdp.Page(b, "T1"), text="x",
+                                       ref_gone=None, backend_id=None,
+                                       timeout=0.2)
+
+    asyncio.run(scenario())
+    assert len(connects) == 1
