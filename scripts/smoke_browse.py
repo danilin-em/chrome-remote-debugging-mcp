@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from chrome_remote_debugging_mcp import actions, browse, cdp  # noqa: E402
+from chrome_remote_debugging_mcp import actions, autoconnect, browse, cdp  # noqa: E402
 
 # Matches the start of any interactive line ax.py can render — "role#ref ...",
 # e.g. "link#3 ..." or "button#5 ...". Keyed off the shape (a role name, "#",
@@ -28,21 +28,49 @@ async def main() -> None:
     parser.add_argument("--cdp-url", default="http://127.0.0.1:9223")
     parser.add_argument("--url", default="https://news.ycombinator.com/")
     parser.add_argument("--click-text", default="More")
+    parser.add_argument("--autoconnect", action="store_true",
+                        help="drive the user's running Chrome via DevToolsActivePort "
+                             "(needs a click on Allow); opens and closes its own tab")
+    parser.add_argument("--ssh", metavar="TARGET", default=None,
+                        help="with --autoconnect: reach Chrome on this ssh host")
+    parser.add_argument("--user-data-dir", default=autoconnect.DEFAULT_USER_DATA_DIR,
+                        help="with --autoconnect: Chrome profile directory")
     args = parser.parse_args()
 
-    b = cdp.Browser(lambda: cdp.browser_ws_url(args.cdp_url))
+    ac = None
+    if args.autoconnect:
+        ac = autoconnect.AutoConnect(args.ssh, args.user_data_dir, None)
+        b = cdp.Browser(ac.ws_url, connect=ac.connect)
+        print("click Allow in Chrome", file=sys.stderr)
+    else:
+        b = cdp.Browser(lambda: cdp.browser_ws_url(args.cdp_url))
     try:
         await _run(b, args)
+    except autoconnect.AutoConnectError as exc:
+        sys.exit(str(exc))
     finally:
         await b.close()
+        if ac is not None:
+            ac.stop()
 
 
 async def _run(b: cdp.Browser, args: argparse.Namespace) -> None:
+    if args.autoconnect:
+        # The user's own Chrome: use a tab of our own, never one of theirs.
+        tab_id = (await b.call("Target.createTarget", {"url": "about:blank"}))["targetId"]
+        try:
+            await _drive(b, args, tab_id)
+        finally:
+            await b.call("Target.closeTarget", {"targetId": tab_id})
+        return
     infos = (await b.call("Target.getTargets"))["targetInfos"]
     info = next((t for t in infos if t.get("type") == "page"), None)
     if info is None:
         sys.exit(f"no page target found at {args.cdp_url}")
-    tab_id = info["targetId"]
+    await _drive(b, args, info["targetId"])
+
+
+async def _drive(b: cdp.Browser, args: argparse.Namespace, tab_id: str) -> None:
     page = cdp.Page(b, tab_id)
 
     await cdp.send(page, "Page.navigate", {"url": args.url})
