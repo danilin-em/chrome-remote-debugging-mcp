@@ -6,13 +6,7 @@ import pytest
 
 import chrome_remote_debugging_mcp.server as server
 
-PAGE = {
-    "id": "T1",
-    "type": "page",
-    "title": "x",
-    "url": "about:blank",
-    "webSocketDebuggerUrl": "ws://fake",
-}
+PAGE = {"targetId": "T1", "type": "page", "title": "x", "url": "about:blank"}
 
 
 def _fn(tool):
@@ -20,32 +14,54 @@ def _fn(tool):
     return getattr(tool, "fn", tool)
 
 
-def _stub(monkeypatch, targets=None, send_result=None, send_exc=None, new=PAGE):
-    async def fake_list_targets(url):
-        if targets is None:
-            raise RuntimeError("connection refused")
-        return targets
+@pytest.fixture(autouse=True)
+def _no_browser(monkeypatch):
+    # The real connection is bound to the event loop that opened it, and
+    # every test runs its own asyncio.run — never carry one across tests.
+    monkeypatch.setattr(server, "_BROWSER", None)
 
-    async def fake_new_target(url):
-        if targets is None:
-            raise RuntimeError("connection refused")
-        return new
 
-    async def fake_send(ws_url, method, params=None):
+class FakeBrowser:
+    """Stands in for ``cdp.Browser``: answers browser-level commands from
+    canned data and records every call as ``(method, params)``. With
+    ``targets=None`` every call fails as if Chrome were unreachable;
+    ``errors`` maps a method to the exception it raises."""
+
+    def __init__(self, targets, new="T1", version=None, errors=None):
+        self.targets, self.new, self.version = targets, new, version or {}
+        self.errors = errors or {}
+        self.calls = []
+
+    async def call(self, method, params=None, **kw):
+        self.calls.append((method, params))
+        if self.targets is None:
+            raise RuntimeError("connection refused")
+        if method in self.errors:
+            raise self.errors[method]
+        return {
+            "Target.getTargets": {"targetInfos": self.targets},
+            "Target.createTarget": {"targetId": self.new},
+            "Target.closeTarget": {"success": True},
+            "Browser.getVersion": self.version,
+        }[method]
+
+
+def _stub(monkeypatch, targets=None, send_result=None, send_exc=None, new="T1",
+          version=None, errors=None):
+    fake = FakeBrowser(targets, new, version, errors)
+
+    async def fake_send(page, method, params=None):
         if send_exc is not None:
             raise send_exc
         return send_result
 
-    monkeypatch.setattr(server.cdp, "list_targets", fake_list_targets)
-    monkeypatch.setattr(server.cdp, "new_target", fake_new_target)
+    monkeypatch.setattr(server, "_browser", lambda: fake)
     monkeypatch.setattr(server.cdp, "send", fake_send)
+    return fake
 
 
 def test_ping_connected(monkeypatch):
-    async def fake_version(url):
-        return {"Browser": "Chrome/120.0", "Protocol-Version": "1.3"}
-
-    monkeypatch.setattr(server.cdp, "get_version", fake_version)
+    _stub(monkeypatch, targets=[], version={"product": "Chrome/120.0", "protocolVersion": "1.3"})
     out = asyncio.run(_fn(server.ping)())
     assert out["connected"] is True
     assert out["browser"] == "Chrome/120.0"
@@ -53,10 +69,7 @@ def test_ping_connected(monkeypatch):
 
 
 def test_ping_disconnected(monkeypatch):
-    async def fake_version(url):
-        raise RuntimeError("connection refused")
-
-    monkeypatch.setattr(server.cdp, "get_version", fake_version)
+    _stub(monkeypatch, targets=None)
     out = asyncio.run(_fn(server.ping)())
     assert out["connected"] is False
     assert "refused" in out["error"]
@@ -73,14 +86,7 @@ def test_cdp_command_raw_passthrough(monkeypatch):
 
 
 def test_cdp_command_reports_cdp_error(monkeypatch):
-    async def fake_list_targets(url):
-        return [PAGE]
-
-    async def fake_send(ws_url, method, params=None):
-        raise server.cdp.CDPError("'Nope.method' wasn't found")
-
-    monkeypatch.setattr(server.cdp, "list_targets", fake_list_targets)
-    monkeypatch.setattr(server.cdp, "send", fake_send)
+    _stub(monkeypatch, targets=[PAGE], send_exc=server.cdp.CDPError("'Nope.method' wasn't found"))
     out = asyncio.run(_fn(server.cdp_command)("Nope.method", "T1"))
     assert "CDP error" in out["error"]
 
@@ -135,7 +141,7 @@ def test_evaluate_falls_back_to_text_for_exception(monkeypatch):
 # --- list_tabs ------------------------------------------------------------
 
 def test_list_tabs_filters_to_pages(monkeypatch):
-    worker = {"id": "BG", "type": "service_worker", "title": "sw", "url": "chrome://sw"}
+    worker = {"targetId": "BG", "type": "service_worker", "title": "sw", "url": "chrome://sw"}
     _stub(monkeypatch, targets=[PAGE, worker])
     out = asyncio.run(_fn(server.list_tabs)())
     assert out == {
@@ -173,18 +179,17 @@ def test_navigate_reports_generic_failure(monkeypatch):
 # --- _resolve_target error branches (surfaced through navigate) -----------
 
 def test_navigate_opens_a_new_tab_when_tab_id_omitted(monkeypatch):
-    fresh = {**PAGE, "id": "NEW", "webSocketDebuggerUrl": "ws://new"}
     seen = []
 
-    async def fake_send(ws_url, method, params=None):
-        seen.append(ws_url)
+    async def fake_send(page, method, params=None):
+        seen.append(page)
         return {"frameId": "F1"}
 
-    _stub(monkeypatch, targets=[PAGE], new=fresh)
+    fake = _stub(monkeypatch, targets=[PAGE], new="NEW")
     monkeypatch.setattr(server.cdp, "send", fake_send)
     out = asyncio.run(_fn(server.navigate)("https://example.com"))
     assert out["tab_id"] == "NEW"
-    assert seen == ["ws://new"]
+    assert seen == [server.cdp.Page(fake, "NEW")]
 
 
 def test_navigate_reports_a_new_tab_failure(monkeypatch):
@@ -200,15 +205,8 @@ def test_navigate_unknown_tab_id(monkeypatch):
     assert out["error"] == "tab ZZ not found"
 
 
-def test_navigate_target_without_ws_url(monkeypatch):
-    detached = {"id": "T2", "type": "page", "title": "y", "url": "about:blank"}
-    _stub(monkeypatch, targets=[detached])
-    out = asyncio.run(_fn(server.navigate)("https://example.com", tab_id="T2"))
-    assert "webSocketDebuggerUrl" in out["error"]
-
-
 def test_navigate_picks_requested_tab(monkeypatch):
-    second = {**PAGE, "id": "T2", "webSocketDebuggerUrl": "ws://two"}
+    second = {**PAGE, "targetId": "T2"}
     _stub(monkeypatch, targets=[PAGE, second], send_result={"frameId": "F2"})
     out = asyncio.run(_fn(server.navigate)("https://e", tab_id="T2"))
     assert out["tab_id"] == "T2"
@@ -227,6 +225,63 @@ def test_cdp_command_reports_generic_failure(monkeypatch):
     out = asyncio.run(_fn(server.cdp_command)("DOM.getDocument", "T1"))
     assert "CDP command failed" in out["error"]
     assert "boom" in out["error"]
+
+
+# --- the persistent browser connection --------------------------------------
+
+def test_list_tabs_maps_target_infos(monkeypatch):
+    worker = {"targetId": "BG", "type": "service_worker", "title": "sw", "url": "chrome://sw"}
+    page = {"targetId": "T1", "type": "page", "title": "Home", "url": "http://a/",
+            "attached": False, "browserContextId": "C1"}
+    _stub(monkeypatch, targets=[page, worker])
+    out = asyncio.run(_fn(server.list_tabs)())
+    assert out == {"tabs": [{"id": "T1", "title": "Home", "url": "http://a/", "type": "page"}]}
+
+
+def test_open_target_uses_create_target(monkeypatch):
+    fake = _stub(monkeypatch, targets=[PAGE], send_result={"frameId": "F1"}, new="NEW")
+    out = asyncio.run(_fn(server.navigate)("https://example.com"))
+    assert ("Target.createTarget", {"url": "about:blank"}) in fake.calls
+    assert out["tab_id"] == "NEW"
+
+
+def test_close_tab_uses_close_target(monkeypatch):
+    fake = _stub(monkeypatch, targets=[PAGE])
+    out = asyncio.run(_fn(server.close_tab)("T1"))
+    assert fake.calls[-1] == ("Target.closeTarget", {"targetId": "T1"})
+    assert out == {"tab_id": "T1", "closed": True}
+
+
+def test_ping_uses_browser_get_version(monkeypatch):
+    fake = _stub(monkeypatch, targets=[], version={"product": "Chrome/155", "protocolVersion": "1.3"})
+    monkeypatch.setattr(server, "CDP_URL", "http://localhost:9222")
+    out = asyncio.run(_fn(server.ping)())
+    assert fake.calls == [("Browser.getVersion", None)]
+    assert out == {"connected": True, "cdp_url": "http://localhost:9222",
+                   "browser": "Chrome/155", "protocol": "1.3"}
+
+
+@pytest.mark.parametrize("exc", [server.cdp.CDPDisconnected("closed"),
+                                 server.cdp.TargetDetached("closed")])
+def test_tool_reports_disconnect_as_error(monkeypatch, exc):
+    _stub(monkeypatch, targets=[PAGE], send_exc=exc)
+    out = asyncio.run(_fn(server.evaluate)("1", "T1"))
+    assert "closed" in out["error"]
+
+
+def test_browser_provider_reads_cdp_url_at_connect_time(monkeypatch):
+    seen = []
+
+    async def fake_browser_ws_url(cdp_url):
+        seen.append(cdp_url)
+        return "ws://127.0.0.1:5555/devtools/browser/X"
+
+    browser = server._browser()
+    assert server._browser() is browser
+    monkeypatch.setattr(server, "CDP_URL", "http://127.0.0.1:5555")
+    monkeypatch.setattr(server.cdp, "browser_ws_url", fake_browser_ws_url)
+    assert asyncio.run(browser._ws_url()) == "ws://127.0.0.1:5555/devtools/browser/X"
+    assert seen == ["http://127.0.0.1:5555"]
 
 
 # --- main() lifecycle -----------------------------------------------------
@@ -314,12 +369,12 @@ def test_main_stops_tunnel_even_when_run_raises(monkeypatch):
 def _stub_browse(monkeypatch, view="url    http://a/\ntitle  T\n\nbutton#1 \"Жми\"",
                  refs=1, url="http://a/", steps=None, error=None,
                  snapshot_exc=None, run_actions_exc=None):
-    async def fake_snapshot(ws_url, tab_id):
+    async def fake_snapshot(page, tab_id):
         if snapshot_exc is not None:
             raise snapshot_exc
         return view, refs, url
 
-    async def fake_run_actions(ws_url, tab_id, action_list):
+    async def fake_run_actions(page, tab_id, action_list):
         if run_actions_exc is not None:
             raise run_actions_exc
         return steps if steps is not None else [], error
@@ -332,7 +387,7 @@ def test_browse_navigates_then_returns_the_view(monkeypatch):
     _stub(monkeypatch, targets=[PAGE], send_result={})
     _stub_browse(monkeypatch)
 
-    async def fake_settle(ws_url, timeout=2.0):
+    async def fake_settle(page, timeout=2.0):
         return None
 
     monkeypatch.setattr(server.actions, "settle", fake_settle)
@@ -350,7 +405,7 @@ def test_browse_returns_the_post_navigation_url_not_the_requested_one(monkeypatc
     _stub(monkeypatch, targets=[PAGE], send_result={})
     _stub_browse(monkeypatch, url="http://a/redirected")
 
-    async def fake_settle(ws_url, timeout=2.0):
+    async def fake_settle(page, timeout=2.0):
         return None
 
     monkeypatch.setattr(server.actions, "settle", fake_settle)
@@ -374,7 +429,7 @@ def test_browse_reports_a_snapshot_failure(monkeypatch):
     _stub(monkeypatch, targets=[PAGE], send_result={})
     _stub_browse(monkeypatch, snapshot_exc=RuntimeError("tree gone"))
 
-    async def fake_settle(ws_url, timeout=2.0):
+    async def fake_settle(page, timeout=2.0):
         return None
 
     monkeypatch.setattr(server.actions, "settle", fake_settle)
@@ -385,14 +440,11 @@ def test_browse_reports_a_snapshot_failure(monkeypatch):
 def test_browse_view_snapshots_without_navigating(monkeypatch):
     calls = []
 
-    async def fake_list_targets(url):
-        return [PAGE]
-
-    async def fake_send(ws_url, method, params=None):
+    async def fake_send(page, method, params=None):
         calls.append(method)
         return {}
 
-    monkeypatch.setattr(server.cdp, "list_targets", fake_list_targets)
+    _stub(monkeypatch, targets=[PAGE])
     monkeypatch.setattr(server.cdp, "send", fake_send)
     _stub_browse(monkeypatch)
     out = asyncio.run(_fn(server.browse_view)("T1"))
@@ -460,32 +512,27 @@ def test_browse_act_reports_an_action_batch_failure(monkeypatch):
 
 
 def test_browse_in_an_existing_tab_does_not_open_a_new_one(monkeypatch):
-    _stub(monkeypatch, targets=[PAGE], send_result={}, new=None)
+    fake = _stub(monkeypatch, targets=[PAGE], send_result={}, new="NEW")
     _stub_browse(monkeypatch)
 
-    async def fake_settle(ws_url, timeout=2.0):
+    async def fake_settle(page, timeout=2.0):
         return None
 
     monkeypatch.setattr(server.actions, "settle", fake_settle)
     out = asyncio.run(_fn(server.browse)("http://a/", tab_id="T1"))
     assert out["tab_id"] == "T1"
+    assert ("Target.createTarget", {"url": "about:blank"}) not in fake.calls
 
 
 # --- close_tab --------------------------------------------------------------
 
 def test_close_tab_closes_and_forgets_the_refs(monkeypatch):
-    _stub(monkeypatch, targets=[PAGE])
-    closed = []
-
-    async def fake_close_target(url, target_id):
-        closed.append(target_id)
-
-    monkeypatch.setattr(server.cdp, "close_target", fake_close_target)
+    fake = _stub(monkeypatch, targets=[PAGE])
     server.browse_engine.REGISTRY["T1"] = object()
     server.browse_engine._lock_for("T1")
     out = asyncio.run(_fn(server.close_tab)("T1"))
     assert out == {"tab_id": "T1", "closed": True}
-    assert closed == ["T1"]
+    assert ("Target.closeTarget", {"targetId": "T1"}) in fake.calls
     assert "T1" not in server.browse_engine.REGISTRY
     assert "T1" not in server.browse_engine._LOCKS
 
@@ -497,12 +544,7 @@ def test_close_tab_reports_an_unknown_tab(monkeypatch):
 
 
 def test_close_tab_reports_a_close_failure(monkeypatch):
-    _stub(monkeypatch, targets=[PAGE])
-
-    async def fake_close_target(url, target_id):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(server.cdp, "close_target", fake_close_target)
+    _stub(monkeypatch, targets=[PAGE], errors={"Target.closeTarget": RuntimeError("boom")})
     out = asyncio.run(_fn(server.close_tab)("T1"))
     assert out["error"] == "cannot close tab T1: boom"
 
@@ -521,16 +563,10 @@ class _TunnelSpy:
 
 
 def test_list_tabs_revives_tunnel_before_talking_to_chrome(monkeypatch):
-    events = []
-
-    async def fake_list_targets(url):
-        events.append("list_targets")
-        return [PAGE]
-
-    monkeypatch.setattr(server.cdp, "list_targets", fake_list_targets)
-    monkeypatch.setattr(server, "_TUNNEL", _TunnelSpy(events))
+    fake = _stub(monkeypatch, targets=[PAGE])
+    monkeypatch.setattr(server, "_TUNNEL", _TunnelSpy(fake.calls))
     out = asyncio.run(_fn(server.list_tabs)())
-    assert events == ["ensure_alive", "list_targets"]
+    assert fake.calls == ["ensure_alive", ("Target.getTargets", None)]
     assert out["tabs"][0]["id"] == "T1"
 
 
@@ -551,14 +587,12 @@ def test_new_tab_revives_tunnel_first(monkeypatch):
 
 
 def test_ping_reports_a_tunnel_that_cannot_be_revived(monkeypatch):
-    async def fake_version(url):
-        raise AssertionError("must not reach Chrome through a dead tunnel")
-
-    monkeypatch.setattr(server.cdp, "get_version", fake_version)
+    fake = _stub(monkeypatch, targets=[])
     monkeypatch.setattr(server, "_TUNNEL", _TunnelSpy([], RuntimeError("tunnel down")))
     out = asyncio.run(_fn(server.ping)())
     assert out["connected"] is False
     assert "tunnel down" in out["error"]
+    assert fake.calls == []  # never reached Chrome through a dead tunnel
 
 
 def test_main_exposes_tunnel_while_serving(monkeypatch):
@@ -607,17 +641,11 @@ class _LauncherSpy:
 
 
 def test_ping_launches_chrome_and_reports_its_url(monkeypatch):
-    seen = []
-
-    async def fake_version(url):
-        seen.append(url)
-        return {"Browser": "Chrome/141.0", "Protocol-Version": "1.3"}
-
-    monkeypatch.setattr(server.cdp, "get_version", fake_version)
+    fake = _stub(monkeypatch, targets=[], version={"product": "Chrome/141.0", "protocolVersion": "1.3"})
     monkeypatch.setattr(server, "CDP_URL", "http://localhost:9222")
     monkeypatch.setattr(server, "_LAUNCHER", _LauncherSpy())
     out = asyncio.run(_fn(server.ping)())
-    assert seen == ["http://127.0.0.1:41234"]
+    assert fake.calls == [("Browser.getVersion", None)]
     assert out["connected"] is True
     assert out["cdp_url"] == "http://127.0.0.1:41234"
 
@@ -655,14 +683,12 @@ def test_new_tab_reports_a_chrome_that_cannot_be_launched(monkeypatch):
 
 
 def test_ping_reports_a_chrome_that_cannot_be_launched(monkeypatch):
-    async def fake_version(url):
-        raise AssertionError("must not talk to Chrome when the launch failed")
-
-    monkeypatch.setattr(server.cdp, "get_version", fake_version)
+    fake = _stub(monkeypatch, targets=[])
     monkeypatch.setattr(server, "_LAUNCHER", _LauncherSpy(exc=RuntimeError("Chrome not found in PATH")))
     out = asyncio.run(_fn(server.ping)())
     assert out["connected"] is False
     assert "Chrome not found in PATH" in out["error"]
+    assert fake.calls == []  # never talked to Chrome when the launch failed
 
 
 @pytest.mark.parametrize("cdp_url_set, ssh", [(True, None), (False, "user@remote")])

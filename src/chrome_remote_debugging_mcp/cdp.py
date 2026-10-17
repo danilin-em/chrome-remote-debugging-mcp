@@ -1,8 +1,9 @@
 """Thin Chrome DevTools Protocol (CDP) client.
 
-One job: talk to a running Chrome's remote-debugging endpoint. It can
-enumerate targets over HTTP and run CDP commands in a tab's session over one
-persistent browser websocket. No MCP awareness lives here, which keeps it
+One job: talk to a running Chrome's remote-debugging endpoint. Every CDP
+command — browser-level ones and those run in a tab's session — goes over one
+persistent browser websocket; the only HTTP request is ``/json/version``, to
+learn that socket's address. No MCP awareness lives here, which keeps it
 independently testable.
 """
 
@@ -61,51 +62,6 @@ class TargetDetached(Exception):
 
     Not a :class:`CDPError`, for the same reason as :class:`CDPTimeout`.
     """
-
-
-async def list_targets(cdp_url: str) -> list[dict]:
-    """Return raw Chrome target objects via ``GET {cdp_url}/json/list``.
-
-    Each target dict carries ``id``, ``type``, ``title``, ``url`` and, for
-    attachable targets, ``webSocketDebuggerUrl``.
-    """
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(f"{cdp_url}/json/list", timeout=10.0)
-        resp.raise_for_status()
-        return resp.json()
-
-
-async def get_version(cdp_url: str) -> dict:
-    """Return Chrome/Browser info via ``GET {cdp_url}/json/version``.
-
-    Cheapest CDP endpoint — used as a connectivity probe. Carries ``Browser``,
-    ``Protocol-Version``, ``User-Agent``, and the browser-level websocket url.
-    """
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(f"{cdp_url}/json/version", timeout=10.0)
-        resp.raise_for_status()
-        return resp.json()
-
-
-async def new_target(cdp_url: str) -> dict:
-    """Open a new blank tab via ``PUT {cdp_url}/json/new?about:blank``.
-
-    Returns the new target dict (same shape as a ``/json/list`` entry). Always
-    opens ``about:blank`` — callers navigate with ``Page.navigate`` afterwards,
-    which sidesteps escaping an arbitrary url into the query string. Chrome
-    111+ refuses ``GET`` here, hence ``PUT``.
-    """
-    async with httpx.AsyncClient() as client:
-        resp = await client.put(f"{cdp_url}/json/new?about:blank", timeout=10.0)
-        resp.raise_for_status()
-        return resp.json()
-
-
-async def close_target(cdp_url: str, target_id: str) -> None:
-    """Close a target via ``GET {cdp_url}/json/close/{target_id}``."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(f"{cdp_url}/json/close/{target_id}", timeout=10.0)
-        resp.raise_for_status()
 
 
 async def browser_ws_url(cdp_url: str) -> str:

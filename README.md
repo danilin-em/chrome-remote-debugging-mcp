@@ -54,9 +54,16 @@ id; every other tab-scoped tool requires an explicit `tab_id`. Close tabs you ar
 done with via `close_tab`.
 
 `cdp_command` is a raw CDP escape hatch: pass any CDP `method` + `params` and get
-the raw response, for cases the typed tools above don't cover. It targets a *page*
-socket, so page-domain methods work (`Page.*`, `DOM.*`, `Runtime.*`,
-`Network.*`, …); browser-level domains (`Browser.*`, `Target.*`) do not.
+the raw response, for cases the typed tools above don't cover. It runs in the
+tab's persistent session, so `objectId`/`nodeId` values and domain state (e.g.
+after `Network.enable`) carry over between calls while the tab is open and the
+server's connection to Chrome stays up. Events
+are not delivered, so a command that waits for the client to answer one hangs
+the tab until it is undone or the tab is closed: `Fetch.enable` (undo with
+`Fetch.disable`), `Debugger.pause` (`Debugger.resume`), `Target.setAutoAttach`
+with `waitForDebuggerOnStart: true` (set it back to `false`) and
+`Page.setInterceptFileChooserDialog` with `enabled: true` (set it to `false`).
+`Browser.*` and `Target.*` are not supported; their results are undefined.
 
 On any Chrome connection problem a tool returns `{"error": "..."}` instead of
 crashing.
@@ -141,8 +148,8 @@ the wrong thing. Take a new view and use its numbers.
 **Refs in a child frame can be seen but not acted on.** The view is built from
 every frame — including cross-origin iframes, which a JavaScript DOM walk
 cannot reach at all — so an element inside one still gets a `#N` ref and
-prints in the view. But every action is dispatched against the page target's
-own websocket, which only ever reaches the main frame's renderer; a node in a
+prints in the view. But every action is dispatched in the page target's own
+session, which only ever reaches the main frame's renderer; a node in a
 same- or cross-origin child frame lives in a different coordinate space (and,
 cross-origin, a different renderer process) this tool has no way to address.
 Acting on such a ref is refused with an explicit "not the main frame" error

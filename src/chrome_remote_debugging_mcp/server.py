@@ -57,6 +57,8 @@ CHROME_LAUNCH = _env_flag("CHROME_LAUNCH")
 _CDP_URL_SET = "CDP_URL" in os.environ
 # The launcher while main() is serving with CHROME_LAUNCH, else None.
 _LAUNCHER: ChromeLauncher | None = None
+# The one persistent browser connection, created by the first _browser().
+_BROWSER: cdp.Browser | None = None
 
 mcp = FastMCP("chrome-remote-debugging-mcp")
 
@@ -90,19 +92,40 @@ async def _ensure_chrome() -> None:
         CDP_URL = await asyncio.to_thread(_LAUNCHER.ensure_alive)
 
 
+def _browser() -> cdp.Browser:
+    """The process-wide browser connection, created on first use.
+
+    Its address provider reads ``CDP_URL`` at connect time, not now: a
+    respawned tunnel or a relaunched Chrome rewrites ``CDP_URL``, and the
+    next reconnect must follow it.
+    """
+    global _BROWSER
+    if _BROWSER is None:
+        _BROWSER = cdp.Browser(lambda: cdp.browser_ws_url(CDP_URL))
+    return _BROWSER
+
+
 async def _page_targets() -> list[dict]:
-    """Return only the ``page`` targets from Chrome (i.e. real tabs)."""
+    """Return only the ``page`` targets from Chrome (i.e. real tabs).
+
+    Each is reduced to ``{"id", "type", "title", "url"}``.
+    """
     await _ensure_tunnel()
     await _ensure_chrome()
-    targets = await cdp.list_targets(CDP_URL)
-    return [t for t in targets if t.get("type") == "page"]
+    result = await _browser().call("Target.getTargets")
+    return [
+        {"id": t.get("targetId"), "type": t.get("type"),
+         "title": t.get("title"), "url": t.get("url")}
+        for t in result["targetInfos"]
+        if t.get("type") == "page"
+    ]
 
 
-async def _resolve_target(tab_id: str) -> tuple[dict, str]:
-    """Resolve ``tab_id`` to ``(target, ws_url)``.
+async def _resolve_target(tab_id: str) -> tuple[dict, cdp.Page]:
+    """Resolve ``tab_id`` to ``(target, page)``.
 
     Raises :class:`_TargetError` with a human-readable message when Chrome is
-    unreachable, the id is unknown, or the target is not attachable.
+    unreachable or the id is unknown.
     """
     try:
         pages = await _page_targets()
@@ -112,32 +135,27 @@ async def _resolve_target(tab_id: str) -> tuple[dict, str]:
     target = next((t for t in pages if t.get("id") == tab_id), None)
     if target is None:
         raise _TargetError(f"tab {tab_id} not found")
-    return target, _ws_url(target)
+    return target, cdp.Page(_browser(), tab_id)
 
 
-async def _open_target() -> tuple[dict, str]:
-    """Open a new blank tab and return ``(target, ws_url)``."""
+async def _open_target() -> tuple[dict, cdp.Page]:
+    """Open a new blank tab and return ``(target, page)``."""
     try:
         await _ensure_tunnel()
         await _ensure_chrome()
-        target = await cdp.new_target(CDP_URL)
+        result = await _browser().call("Target.createTarget", {"url": "about:blank"})
     except Exception as exc:
         raise _TargetError(f"cannot open a new tab at {CDP_URL}: {exc}")
-    return target, _ws_url(target)
+    tab_id = result["targetId"]
+    target = {"id": tab_id, "type": "page", "title": "", "url": "about:blank"}
+    return target, cdp.Page(_browser(), tab_id)
 
 
-async def _target_or_new(tab_id: str | None) -> tuple[dict, str]:
+async def _target_or_new(tab_id: str | None) -> tuple[dict, cdp.Page]:
     """``tab_id``'s target, or a freshly opened tab when ``tab_id`` is None."""
     if tab_id is None:
         return await _open_target()
     return await _resolve_target(tab_id)
-
-
-def _ws_url(target: dict) -> str:
-    ws_url = target.get("webSocketDebuggerUrl")
-    if not ws_url:
-        raise _TargetError("target has no webSocketDebuggerUrl (already attached?)")
-    return ws_url
 
 
 @mcp.tool()
@@ -151,14 +169,14 @@ async def ping() -> dict:
     try:
         await _ensure_tunnel()
         await _ensure_chrome()
-        info = await cdp.get_version(CDP_URL)
+        info = await _browser().call("Browser.getVersion")
     except Exception as exc:
         return {"connected": False, "cdp_url": CDP_URL, "error": str(exc)}
     return {
         "connected": True,
         "cdp_url": CDP_URL,
-        "browser": info.get("Browser"),
-        "protocol": info.get("Protocol-Version"),
+        "browser": info.get("product"),
+        "protocol": info.get("protocolVersion"),
     }
 
 
@@ -195,12 +213,12 @@ async def navigate(url: str, tab_id: str | None = None) -> dict:
     on success, ``{"error": ...}`` otherwise.
     """
     try:
-        target, ws_url = await _target_or_new(tab_id)
+        target, page = await _target_or_new(tab_id)
     except _TargetError as exc:
         return {"error": str(exc)}
 
     try:
-        result = await cdp.send(ws_url, "Page.navigate", {"url": url})
+        result = await cdp.send(page, "Page.navigate", {"url": url})
     except cdp.CDPError as exc:
         return {"error": f"CDP error: {exc}"}
     except Exception as exc:
@@ -219,13 +237,13 @@ async def evaluate(expression: str, tab_id: str) -> dict:
     A promise that does not settle within 30 s is reported as an error.
     """
     try:
-        target, ws_url = await _resolve_target(tab_id)
+        target, page = await _resolve_target(tab_id)
     except _TargetError as exc:
         return {"error": str(exc)}
 
     try:
         result = await cdp.send(
-            ws_url,
+            page,
             "Runtime.evaluate",
             {"expression": expression, "returnByValue": True, "awaitPromise": True},
         )
@@ -253,18 +271,27 @@ async def cdp_command(method: str, tab_id: str, params: dict | None = None) -> d
 
     Use when the higher-level tools don't cover what you need. ``method`` is any
     CDP method (e.g. ``"Page.captureScreenshot"``, ``"DOM.getDocument"``,
-    ``"Network.enable"``); ``params`` are its parameters. Runs against the given
-    tab. Note: this targets a *page* websocket, so
-    page-domain methods work; browser-level domains (``Browser.*``, ``Target.*``)
-    do not. Returns ``{"tab_id", "method", "result"}`` or ``{"error": ...}``.
+    ``"Network.enable"``); ``params`` are its parameters. Runs in the given
+    tab's persistent session, so ``objectId``/``nodeId`` values and domain
+    state (e.g. ``Network.enable``) carry over between calls while the tab is
+    open and the connection lives.
+
+    Events are not delivered. So ``Fetch.enable``, ``Debugger.pause``,
+    ``Target.setAutoAttach {waitForDebuggerOnStart: true}`` and
+    ``Page.setInterceptFileChooserDialog {enabled: true}`` hang the tab until
+    undone (``Fetch.disable``, ``Debugger.resume``,
+    ``…{waitForDebuggerOnStart: false}``, ``…{enabled: false}``) or the tab is
+    closed. ``Browser.*`` and ``Target.*`` are not supported; their results
+    are undefined. Returns ``{"tab_id", "method", "result"}`` or
+    ``{"error": ...}``.
     """
     try:
-        target, ws_url = await _resolve_target(tab_id)
+        target, page = await _resolve_target(tab_id)
     except _TargetError as exc:
         return {"error": str(exc)}
 
     try:
-        result = await cdp.send(ws_url, method, params or {})
+        result = await cdp.send(page, method, params or {})
     except cdp.CDPError as exc:
         return {"error": f"CDP error: {exc}"}
     except Exception as exc:
@@ -286,18 +313,18 @@ async def browse(url: str, tab_id: str | None = None) -> dict:
     ``{"tab_id", "url", "view", "refs"}`` or ``{"error": ...}``.
     """
     try:
-        target, ws_url = await _target_or_new(tab_id)
+        target, page = await _target_or_new(tab_id)
     except _TargetError as exc:
         return {"error": str(exc)}
 
     try:
-        await cdp.send(ws_url, "Page.navigate", {"url": url})
+        await cdp.send(page, "Page.navigate", {"url": url})
     except Exception as exc:
         return {"error": f"navigation failed: {exc}"}
 
-    await actions.settle(ws_url, timeout=10.0)
+    await actions.settle(page, timeout=10.0)
     try:
-        view, refs, observed_url = await browse_engine.snapshot(ws_url, target.get("id"))
+        view, refs, observed_url = await browse_engine.snapshot(page, target.get("id"))
     except Exception as exc:
         return {"error": f"snapshot failed: {exc}"}
     # The post-navigation url the snapshot itself observed (M10), which can
@@ -313,11 +340,11 @@ async def browse_view(tab_id: str) -> dict:
     ``{"tab_id", "view", "refs"}`` or ``{"error": ...}``.
     """
     try:
-        target, ws_url = await _resolve_target(tab_id)
+        target, page = await _resolve_target(tab_id)
     except _TargetError as exc:
         return {"error": str(exc)}
     try:
-        view, refs, _ = await browse_engine.snapshot(ws_url, target.get("id"))
+        view, refs, _ = await browse_engine.snapshot(page, target.get("id"))
     except Exception as exc:
         return {"error": f"snapshot failed: {exc}"}
     return {"tab_id": target.get("id"), "view": view, "refs": refs}
@@ -347,13 +374,13 @@ async def browse_act(actions_list: list[dict], tab_id: str) -> dict:
     step failed, or ``{"error": ...}`` when the tab could not be resolved.
     """
     try:
-        target, ws_url = await _resolve_target(tab_id)
+        target, page = await _resolve_target(tab_id)
     except _TargetError as exc:
         return {"error": str(exc)}
 
     tab = target.get("id")
     try:
-        steps, error = await browse_engine.run_actions(ws_url, tab, actions_list)
+        steps, error = await browse_engine.run_actions(page, tab, actions_list)
     except Exception as exc:
         # I5: run_actions was previously called unguarded — a latent breach of
         # the never-raise contract (unreachable today only because FastMCP's
@@ -361,7 +388,7 @@ async def browse_act(actions_list: list[dict], tab_id: str) -> dict:
         # snapshot already is below.
         return {"tab_id": tab, "error": f"action batch failed: {exc}"}
     try:
-        view, refs, _ = await browse_engine.snapshot(ws_url, tab)
+        view, refs, _ = await browse_engine.snapshot(page, tab)
     except Exception as exc:
         return {"tab_id": tab, "steps": steps, "error": f"snapshot failed: {exc}"}
 
@@ -383,7 +410,7 @@ async def close_tab(tab_id: str) -> dict:
     except _TargetError as exc:
         return {"error": str(exc)}
     try:
-        await cdp.close_target(CDP_URL, tab_id)
+        await _browser().call("Target.closeTarget", {"targetId": tab_id})
     except Exception as exc:
         return {"error": f"cannot close tab {tab_id}: {exc}"}
     browse_engine.forget(tab_id)
