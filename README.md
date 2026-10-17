@@ -224,6 +224,9 @@ click it. That is once per server process: the connection then stays open.
 - **"has not accepted the debugging connection within 45s".** Chrome is
   waiting for you to click **Allow**. Click it and call the tool again; the
   pending connection is kept, so no second dialog appears.
+- **The server was restarted while the Allow dialog was open.** Chrome keeps
+  that dialog even though nothing is waiting on it. Close it with Deny or ×;
+  clicking Allow does nothing for the new server process, which shows its own.
 - **"refused the debugging connection (HTTP 403)".** You clicked Deny, or
   debugging is off. Enable it in `chrome://inspect/#remote-debugging` and call
   the tool again; that call opens a new Allow dialog — click it.
