@@ -139,6 +139,85 @@ def test_evaluate_falls_back_to_text_for_exception(monkeypatch):
     assert out["error"] == "JS exception: Uncaught"
 
 
+# --- evaluate_file --------------------------------------------------------
+
+def _capture_send(monkeypatch, result):
+    # Like _stub, but records the params of every cdp.send.
+    _stub(monkeypatch, targets=[PAGE])
+    sent = []
+
+    async def fake_send(page, method, params=None):
+        sent.append((method, params))
+        return result
+
+    monkeypatch.setattr(server.cdp, "send", fake_send)
+    return sent
+
+
+def test_evaluate_file_runs_file_contents(monkeypatch, tmp_path):
+    script = tmp_path / "big script.js"
+    script.write_text("const a = 1;\na + 41 // trailing comment", encoding="utf-8")
+    sent = _capture_send(monkeypatch, {"result": {"type": "number", "value": 42}})
+    out = asyncio.run(_fn(server.evaluate_file)(str(script), "T1"))
+    assert out == {"tab_id": "T1", "value": 42, "type": "number"}
+    assert sent == [("Runtime.evaluate", {
+        # sourceURL goes on its own line, so a trailing // comment cannot swallow it,
+        # and as a file URI, so a space in the path cannot cut it short.
+        "expression": "const a = 1;\na + 41 // trailing comment\n"
+                      "//# sourceURL=" + script.as_uri(),
+        "returnByValue": True,
+        "awaitPromise": True,
+    })]
+
+
+def test_evaluate_file_expands_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "s.js").write_text("1", encoding="utf-8")
+    sent = _capture_send(monkeypatch, {"result": {"type": "number", "value": 1}})
+    out = asyncio.run(_fn(server.evaluate_file)("~/s.js", "T1"))
+    assert out["value"] == 1
+    assert sent[0][1]["expression"].startswith("1\n//# sourceURL=file://")
+
+
+def test_evaluate_file_reports_js_exception(monkeypatch, tmp_path):
+    script = tmp_path / "s.js"
+    script.write_text("x", encoding="utf-8")
+    _capture_send(monkeypatch, {"exceptionDetails": {"text": "Uncaught"}})
+    out = asyncio.run(_fn(server.evaluate_file)(str(script), "T1"))
+    assert out["error"] == "JS exception: Uncaught"
+
+
+def test_evaluate_file_refuses_relative_path(monkeypatch):
+    sent = _capture_send(monkeypatch, {})
+    out = asyncio.run(_fn(server.evaluate_file)("script.js", "T1"))
+    assert "absolute" in out["error"]
+    assert sent == []
+
+
+def test_evaluate_file_reports_missing_file(monkeypatch, tmp_path):
+    sent = _capture_send(monkeypatch, {})
+    out = asyncio.run(_fn(server.evaluate_file)(str(tmp_path / "nope.js"), "T1"))
+    assert "cannot read" in out["error"]
+    assert sent == []
+
+
+def test_evaluate_file_reports_non_utf8_file(monkeypatch, tmp_path):
+    script = tmp_path / "s.js"
+    script.write_bytes(b"\xff\xfe")
+    sent = _capture_send(monkeypatch, {})
+    out = asyncio.run(_fn(server.evaluate_file)(str(script), "T1"))
+    assert "cannot read" in out["error"]
+    assert sent == []
+
+
+def test_evaluate_file_reports_unreachable_chrome(monkeypatch, tmp_path):
+    script = tmp_path / "s.js"
+    script.write_text("1", encoding="utf-8")
+    _stub(monkeypatch, targets=None)
+    out = asyncio.run(_fn(server.evaluate_file)(str(script), "T1"))
+    assert "cannot reach Chrome" in out["error"]
+
+
 # --- list_tabs ------------------------------------------------------------
 
 def test_list_tabs_filters_to_pages(monkeypatch):

@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import os
+from pathlib import Path
 from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
@@ -262,16 +263,8 @@ async def navigate(url: str, tab_id: str | None = None) -> dict:
     return {"tab_id": target.get("id"), "url": url, "frameId": result.get("frameId")}
 
 
-@mcp.tool()
-@_scoped
-async def evaluate(expression: str, tab_id: str) -> dict:
-    """Evaluate a JavaScript ``expression`` in a Chrome tab.
-
-    Awaits promises and
-    returns the value by value. Returns ``{"tab_id", "value", "type"}`` on
-    success, or ``{"error": ...}`` on failure or an uncaught JS exception.
-    A promise that does not settle within 30 s is reported as an error.
-    """
+async def _run_js(expression: str, tab_id: str) -> dict:
+    """Shared body of ``evaluate`` and ``evaluate_file``."""
     try:
         target, page = await _resolve_target(tab_id)
     except _TargetError as exc:
@@ -299,6 +292,43 @@ async def evaluate(expression: str, tab_id: str) -> dict:
 
     value = result.get("result", {})
     return {"tab_id": target.get("id"), "value": value.get("value"), "type": value.get("type")}
+
+
+@mcp.tool()
+@_scoped
+async def evaluate(expression: str, tab_id: str) -> dict:
+    """Evaluate a short JavaScript ``expression`` in a Chrome tab.
+
+    Only for small snippets (a few lines): for a longer script, write it to a
+    file and run it with ``evaluate_file`` instead. Awaits promises and
+    returns the value by value. Returns ``{"tab_id", "value", "type"}`` on
+    success, or ``{"error": ...}`` on failure or an uncaught JS exception.
+    A promise that does not settle within 30 s is reported as an error.
+    """
+    return await _run_js(expression, tab_id)
+
+
+@mcp.tool()
+@_scoped
+async def evaluate_file(path: str, tab_id: str) -> dict:
+    """Evaluate a JavaScript file in a Chrome tab — ``evaluate`` for big scripts.
+
+    ``path`` must be absolute (``~`` is expanded) and names a UTF-8 file on the
+    machine running this server, not the one running Chrome. Its contents run
+    exactly as an ``evaluate`` expression: the value of the last statement is
+    returned, promises are awaited (30 s limit), and stack traces of a JS
+    exception name the file. Returns ``{"tab_id", "value", "type"}`` or
+    ``{"error": ...}``.
+    """
+    file = Path(path).expanduser()
+    if not file.is_absolute():
+        return {"error": f"path must be absolute: {path}"}
+    try:
+        source = file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return {"error": f"cannot read {file}: {exc}"}
+    # On its own line, so a trailing // comment cannot swallow it.
+    return await _run_js(f"{source}\n//# sourceURL={file.as_uri()}", tab_id)
 
 
 @mcp.tool()

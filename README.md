@@ -43,6 +43,7 @@ Example `mcpServers` entry:
 | `list_tabs` | —                           | `{"tabs": [{id, title, url, type}, ...]}` |
 | `navigate`  | `url`, `tab_id?`            | `{tab_id, url, frameId}`                  |
 | `evaluate`  | `expression`, `tab_id`      | `{tab_id, value, type}`                   |
+| `evaluate_file` | `path`, `tab_id`        | `{tab_id, value, type}`                   |
 | `cdp_command` | `method`, `tab_id`, `params?` | `{tab_id, method, result}`            |
 | `browse`      | `url`, `tab_id?`                | `{tab_id, url, view, refs}`               |
 | `browse_view` | `tab_id`                        | `{tab_id, view, refs}`                    |
@@ -52,6 +53,11 @@ Example `mcpServers` entry:
 `navigate` and `browse` open a **new tab** when `tab_id` is omitted and return its
 id; every other tab-scoped tool requires an explicit `tab_id`. Close tabs you are
 done with via `close_tab`.
+
+`evaluate` is meant for short snippets. For a long script, write it to a file and
+pass its absolute path to `evaluate_file`: the file is read on the machine running
+the server (not the one running Chrome) and evaluated exactly like an `evaluate`
+expression, with the file named in JS stack traces.
 
 `cdp_command` is a raw CDP escape hatch: pass any CDP `method` + `params` and get
 the raw response, for cases the typed tools above don't cover. It runs in the
