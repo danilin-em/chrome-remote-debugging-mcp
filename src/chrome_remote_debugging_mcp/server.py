@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import os
 from pathlib import Path
 from urllib.parse import urlparse
@@ -263,8 +264,14 @@ async def navigate(url: str, tab_id: str | None = None) -> dict:
     return {"tab_id": target.get("id"), "url": url, "frameId": result.get("frameId")}
 
 
-async def _run_js(expression: str, tab_id: str) -> dict:
+async def _run_js(expression: str, tab_id: str, output_path: str | None = None) -> dict:
     """Shared body of ``evaluate`` and ``evaluate_file``."""
+    out_file = None
+    if output_path is not None:
+        out_file = Path(output_path).expanduser()
+        if not out_file.is_absolute():
+            return {"error": f"output_path must be absolute: {output_path}"}
+
     try:
         target, page = await _resolve_target(tab_id)
     except _TargetError as exc:
@@ -291,12 +298,24 @@ async def _run_js(expression: str, tab_id: str) -> dict:
         return {"error": f"JS exception: {text}"}
 
     value = result.get("result", {})
-    return {"tab_id": target.get("id"), "value": value.get("value"), "type": value.get("type")}
+    data, kind = value.get("value"), value.get("type")
+    if out_file is None:
+        return {"tab_id": target.get("id"), "value": data, "type": kind}
+
+    # A string is written as is, so the file reads like the page text;
+    # anything else as JSON. "replace": a JS string may hold a lone surrogate.
+    text = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, indent=2)
+    raw = text.encode("utf-8", errors="replace")
+    try:
+        out_file.write_bytes(raw)
+    except OSError as exc:
+        return {"error": f"cannot write {out_file}: {exc}"}
+    return {"tab_id": target.get("id"), "path": str(out_file), "type": kind, "bytes": len(raw)}
 
 
 @mcp.tool()
 @_scoped
-async def evaluate(expression: str, tab_id: str) -> dict:
+async def evaluate(expression: str, tab_id: str, output_path: str | None = None) -> dict:
     """Evaluate a short JavaScript ``expression`` in a Chrome tab.
 
     Only for small snippets (a few lines): for a longer script, write it to a
@@ -304,13 +323,19 @@ async def evaluate(expression: str, tab_id: str) -> dict:
     returns the value by value. Returns ``{"tab_id", "value", "type"}`` on
     success, or ``{"error": ...}`` on failure or an uncaught JS exception.
     A promise that does not settle within 30 s is reported as an error.
+
+    For a large value (e.g. a page's text) pass ``output_path``: an absolute
+    path (``~`` is expanded) on the machine running this server. The value is
+    written there instead of returned — a string as is (UTF-8), anything else
+    as indented JSON — overwriting any existing file, and the result is
+    ``{"tab_id", "path", "type", "bytes"}``. On an error the file is not written.
     """
-    return await _run_js(expression, tab_id)
+    return await _run_js(expression, tab_id, output_path)
 
 
 @mcp.tool()
 @_scoped
-async def evaluate_file(path: str, tab_id: str) -> dict:
+async def evaluate_file(path: str, tab_id: str, output_path: str | None = None) -> dict:
     """Evaluate a JavaScript file in a Chrome tab — ``evaluate`` for big scripts.
 
     ``path`` must be absolute (``~`` is expanded) and names a UTF-8 file on the
@@ -318,7 +343,8 @@ async def evaluate_file(path: str, tab_id: str) -> dict:
     exactly as an ``evaluate`` expression: the value of the last statement is
     returned, promises are awaited (30 s limit), and stack traces of a JS
     exception name the file. Returns ``{"tab_id", "value", "type"}`` or
-    ``{"error": ...}``.
+    ``{"error": ...}``. ``output_path`` saves the value to a file instead,
+    exactly as in ``evaluate``.
     """
     file = Path(path).expanduser()
     if not file.is_absolute():
@@ -328,7 +354,7 @@ async def evaluate_file(path: str, tab_id: str) -> dict:
     except (OSError, UnicodeDecodeError) as exc:
         return {"error": f"cannot read {file}: {exc}"}
     # On its own line, so a trailing // comment cannot swallow it.
-    return await _run_js(f"{source}\n//# sourceURL={file.as_uri()}", tab_id)
+    return await _run_js(f"{source}\n//# sourceURL={file.as_uri()}", tab_id, output_path)
 
 
 @mcp.tool()

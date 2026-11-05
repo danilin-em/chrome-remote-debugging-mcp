@@ -218,6 +218,87 @@ def test_evaluate_file_reports_unreachable_chrome(monkeypatch, tmp_path):
     assert "cannot reach Chrome" in out["error"]
 
 
+# --- output_path (evaluate / evaluate_file) -------------------------------
+
+def test_evaluate_writes_string_raw_to_output_path(monkeypatch, tmp_path):
+    dest = tmp_path / "issue.txt"
+    _stub(monkeypatch, targets=[PAGE],
+          send_result={"result": {"type": "string", "value": "Задача\n\"цитата\""}})
+    out = asyncio.run(_fn(server.evaluate)("document.body.innerText", "T1", str(dest)))
+    raw = "Задача\n\"цитата\"".encode("utf-8")
+    assert out == {"tab_id": "T1", "path": str(dest), "type": "string", "bytes": len(raw)}
+    assert dest.read_bytes() == raw
+
+
+def test_evaluate_writes_non_string_as_pretty_json(monkeypatch, tmp_path):
+    dest = tmp_path / "data.json"
+    _stub(monkeypatch, targets=[PAGE],
+          send_result={"result": {"type": "object", "value": {"title": "Ёж", "n": [1, 2]}}})
+    out = asyncio.run(_fn(server.evaluate)("x", "T1", str(dest)))
+    assert out["type"] == "object"
+    assert dest.read_text(encoding="utf-8") == (
+        '{\n  "title": "Ёж",\n  "n": [\n    1,\n    2\n  ]\n}'
+    )
+
+
+def test_evaluate_overwrites_existing_output_file(monkeypatch, tmp_path):
+    dest = tmp_path / "out.txt"
+    dest.write_text("old content that is longer", encoding="utf-8")
+    _stub(monkeypatch, targets=[PAGE], send_result={"result": {"type": "string", "value": "new"}})
+    asyncio.run(_fn(server.evaluate)("x", "T1", str(dest)))
+    assert dest.read_text(encoding="utf-8") == "new"
+
+
+def test_evaluate_output_path_expands_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _stub(monkeypatch, targets=[PAGE], send_result={"result": {"type": "string", "value": "hi"}})
+    out = asyncio.run(_fn(server.evaluate)("x", "T1", "~/out.txt"))
+    assert out["path"] == str(tmp_path / "out.txt")
+    assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "hi"
+
+
+def test_evaluate_refuses_relative_output_path_before_running_js(monkeypatch):
+    sent = _capture_send(monkeypatch, {"result": {"type": "string", "value": "x"}})
+    out = asyncio.run(_fn(server.evaluate)("x", "T1", "out.txt"))
+    assert out["error"] == "output_path must be absolute: out.txt"
+    assert sent == []
+
+
+def test_evaluate_reports_unwritable_output_path(monkeypatch, tmp_path):
+    dest = tmp_path / "no-such-dir" / "out.txt"
+    _stub(monkeypatch, targets=[PAGE], send_result={"result": {"type": "string", "value": "x"}})
+    out = asyncio.run(_fn(server.evaluate)("x", "T1", str(dest)))
+    assert out["error"].startswith(f"cannot write {dest}:")
+
+
+def test_evaluate_js_exception_leaves_output_file_untouched(monkeypatch, tmp_path):
+    dest = tmp_path / "out.txt"
+    dest.write_text("keep", encoding="utf-8")
+    _stub(monkeypatch, targets=[PAGE], send_result={"exceptionDetails": {"text": "Uncaught"}})
+    out = asyncio.run(_fn(server.evaluate)("throw 1", "T1", str(dest)))
+    assert out["error"] == "JS exception: Uncaught"
+    assert dest.read_text(encoding="utf-8") == "keep"
+
+
+def test_evaluate_replaces_lone_surrogate_instead_of_raising(monkeypatch, tmp_path):
+    # A JS string may hold a lone surrogate, which UTF-8 cannot encode.
+    dest = tmp_path / "out.txt"
+    _stub(monkeypatch, targets=[PAGE], send_result={"result": {"type": "string", "value": "a\ud800b"}})
+    out = asyncio.run(_fn(server.evaluate)("x", "T1", str(dest)))
+    assert out["bytes"] == 3
+    assert dest.read_bytes() == b"a?b"
+
+
+def test_evaluate_file_writes_to_output_path(monkeypatch, tmp_path):
+    script = tmp_path / "s.js"
+    script.write_text("'big'", encoding="utf-8")
+    dest = tmp_path / "out.txt"
+    _capture_send(monkeypatch, {"result": {"type": "string", "value": "big"}})
+    out = asyncio.run(_fn(server.evaluate_file)(str(script), "T1", str(dest)))
+    assert out == {"tab_id": "T1", "path": str(dest), "type": "string", "bytes": 3}
+    assert dest.read_text(encoding="utf-8") == "big"
+
+
 # --- list_tabs ------------------------------------------------------------
 
 def test_list_tabs_filters_to_pages(monkeypatch):
