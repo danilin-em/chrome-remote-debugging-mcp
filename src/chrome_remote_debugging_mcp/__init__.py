@@ -1,3 +1,5 @@
 """chrome-remote-debugging-mcp — control a running Chrome over CDP via MCP."""
 
-__version__ = "0.2.1"
+from importlib.metadata import version
+
+__version__ = version("chrome-remote-debugging-mcp")
